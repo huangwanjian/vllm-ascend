@@ -23,7 +23,8 @@ namespace RecurrentGatedDeltaRule {
 using namespace matmul;
 using namespace AscendC;
 using namespace AscendC::MicroAPI;
-constexpr uint64_t BUFFER_NUM = 1;
+constexpr uint64_t SINGLE_BUFFER = 1;
+constexpr uint64_t DOUBLE_BUFFER = 2;
 constexpr uint32_t MAX_OUT_BUFFER_NUM = 2;
 constexpr uint64_t MAX_MTP = 8;
 constexpr uint64_t BF16_NUM_PER_BLOCK = 16;
@@ -72,8 +73,8 @@ public:
         hasGamaK_ = (tilingData->hasGamaK == 1);
         useAddFoldReduce_ = (RGDR_ENABLE_ADD_FOLD_REDUCE != 0);
         vStep_ = tilingData->vStep;
-        stateOutBufferNum_ = (tilingData->stateOutBufferNum == MAX_OUT_BUFFER_NUM) ? MAX_OUT_BUFFER_NUM : BUFFER_NUM;
-        attnOutBufferNum_ = (tilingData->attnOutBufferNum == MAX_OUT_BUFFER_NUM) ? MAX_OUT_BUFFER_NUM : BUFFER_NUM;
+        stateOutBufferNum_ = tilingData->stateOutBufferNum;
+        attnOutBufferNum_ = tilingData->attnOutBufferNum;
         restUbSize_ = tilingData->ubRestBytes;
         alignK_ = Ceil(tilingData->dk, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK;
         alignV_ = Ceil(tilingData->dv, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK;
@@ -117,17 +118,17 @@ public:
         uint32_t kSize = MAX_MTP * alignK_ * sizeof(float);
         uint32_t betaNumAlign = Ceil(MAX_MTP * NV_, BF16_NUM_PER_BLOCK) * BF16_NUM_PER_BLOCK;
         uint32_t betaUbSize = betaNumAlign * sizeof(float); //  8: 8 * 4 = 32B;
-        pipe_->InitBuffer(qInQueue_, BUFFER_NUM, MAX_MTP * alignK_ * sizeof(inType));
-        pipe_->InitBuffer(kInQueue_, BUFFER_NUM, MAX_MTP * alignK_ * sizeof(inType));
-        pipe_->InitBuffer(vInQueue_, BUFFER_NUM, MAX_MTP * alignV_ * sizeof(inType));
-        pipe_->InitBuffer(stateInQueue_, BUFFER_NUM, alignK_ * vStep_ * sizeof(stateType));
+        pipe_->InitBuffer(qInQueue_, DOUBLE_BUFFER, MAX_MTP * alignK_ * sizeof(inType));
+        pipe_->InitBuffer(kInQueue_, DOUBLE_BUFFER, MAX_MTP * alignK_ * sizeof(inType));
+        pipe_->InitBuffer(vInQueue_, DOUBLE_BUFFER, MAX_MTP * alignV_ * sizeof(inType));
+        pipe_->InitBuffer(stateInQueue_, DOUBLE_BUFFER, alignK_ * vStep_ * sizeof(stateType));
         if (hasGama_) {
-            pipe_->InitBuffer(gamaInQueue_, BUFFER_NUM, MAX_MTP * NV_ * sizeof(float));
+            pipe_->InitBuffer(gamaInQueue_, DOUBLE_BUFFER, MAX_MTP * NV_ * sizeof(float));
         }
         if (hasGamaK_) {
-            pipe_->InitBuffer(gamaKInQueue_, BUFFER_NUM, MAX_MTP * alignK_ * sizeof(float));
+            pipe_->InitBuffer(gamaKInQueue_, DOUBLE_BUFFER, MAX_MTP * alignK_ * sizeof(float));
         }
-        pipe_->InitBuffer(betaInQueue_, BUFFER_NUM, MAX_MTP * NV_ * sizeof(inType));
+        pipe_->InitBuffer(betaInQueue_, DOUBLE_BUFFER, MAX_MTP * NV_ * sizeof(inType));
         pipe_->InitBuffer(stateOutQueue_, stateOutBufferNum_, alignK_ * vStep_ * sizeof(stateType));
         pipe_->InitBuffer(attnOutQueue_, attnOutBufferNum_, vStep_ * sizeof(outType));
         pipe_->InitBuffer(tmpBuff, restUbSize_);
@@ -427,7 +428,6 @@ private:
         ReduceSumDispatch(deltaInUb, broadTmpInUb, curSingleV);
         AscendC::PipeBarrier<PIPE_V>();
         Sub(deltaInUb, vInUb[curVOffset], deltaInUb, curSingleV);
-        AscendC::PipeBarrier<PIPE_V>();
         Muls(deltaInUb, deltaInUb, beta_, curSingleV);
         AscendC::PipeBarrier<PIPE_V>();
         ProcessKQ(deltaInUb, kInUb[curQKOffset], stateInUb, qInUb[curQKOffset], broadTmpInUb, curSingleV);
@@ -522,7 +522,7 @@ private:
                 gama_ = hasGama_ ? gamaInUb.GetValue(gbOffset) : 1;
                 beta_ = betaInUb.GetValue(gbOffset);
                 Compute(curSingleV, curQKOffset, curVOffset);
-                if (attnOutBufferNum_ == BUFFER_NUM) {
+                if (attnOutBufferNum_ == SINGLE_BUFFER) {
                     CopyOutAttn(attnOffset, curSingleV);
                 } else {
                     if (hasPendingAttn) {
@@ -531,7 +531,7 @@ private:
                     pendingAttnOffset = attnOffset;
                     hasPendingAttn = true;
                 }
-                if (stateOutBufferNum_ == BUFFER_NUM) {
+                if (stateOutBufferNum_ == SINGLE_BUFFER) {
                     CopyOutState(curStateOutOffset, curSingleV);
                 } else {
                     if (hasPendingState) {
@@ -578,13 +578,13 @@ private:
     GlobalTensor<stateType> finalStateGm_;
     GlobalTensor<outType> attnOutGm_;
     TPipe *pipe_;
-    TQue<QuePosition::VECIN, 1> qInQueue_;
-    TQue<QuePosition::VECIN, 1> kInQueue_;
-    TQue<QuePosition::VECIN, 1> vInQueue_;
-    TQue<QuePosition::VECIN, 1> gamaInQueue_;
-    TQue<QuePosition::VECIN, 1> gamaKInQueue_;
-    TQue<QuePosition::VECIN, 1> betaInQueue_;
-    TQue<QuePosition::VECIN, 1> stateInQueue_;
+    TQue<QuePosition::VECIN, DOUBLE_BUFFER> qInQueue_;
+    TQue<QuePosition::VECIN, DOUBLE_BUFFER> kInQueue_;
+    TQue<QuePosition::VECIN, DOUBLE_BUFFER> vInQueue_;
+    TQue<QuePosition::VECIN, DOUBLE_BUFFER> gamaInQueue_;
+    TQue<QuePosition::VECIN, DOUBLE_BUFFER> gamaKInQueue_;
+    TQue<QuePosition::VECIN, DOUBLE_BUFFER> betaInQueue_;
+    TQue<QuePosition::VECIN, DOUBLE_BUFFER> stateInQueue_;
     TQue<QuePosition::VECOUT, MAX_OUT_BUFFER_NUM> attnOutQueue_;
     TQue<QuePosition::VECOUT, MAX_OUT_BUFFER_NUM> stateOutQueue_;
     TBuf<TPosition::VECCALC> tmpBuff;
