@@ -21,6 +21,7 @@ from einops import rearrange
 from vllm.distributed import get_pcp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.fla.ops.l2norm import l2norm_fwd
+from vllm_ascend.ops.triton.fla.l2norm_fused import l2norm_fwd_fused
 from vllm.model_executor.layers.mamba.gdn.base import GatedDeltaNetAttention
 from vllm.model_executor.layers.mamba.mamba_utils import MambaStateShapeCalculator
 from vllm.triton_utils import triton
@@ -644,8 +645,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         if spec_sequence_masks is not None:
             cu_seqlens = spec_query_start_loc[: attn_metadata.num_spec_decodes + 1]
             actual_seq_lengths = torch.cat([cu_seqlens[:1], cu_seqlens[1:] - cu_seqlens[:-1]])
-            query_spec = l2norm_fwd(query_spec)
-            key_spec = l2norm_fwd(key_spec)
+            query_spec, key_spec = l2norm_fwd_fused(query_spec, key_spec)
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
             # The custom op extends dtype support (e.g. float32 state) and is
@@ -688,8 +688,7 @@ class AscendGatedDeltaNetAttention(GatedDeltaNetAttention):
         elif attn_metadata.num_decodes > 0:
             cu_seqlens = non_spec_query_start_loc[: attn_metadata.num_decodes + 1]
             actual_seq_lengths = torch.cat([cu_seqlens[:1], cu_seqlens[1:] - cu_seqlens[:-1]])
-            query_non_spec = l2norm_fwd(query_non_spec)
-            key_non_spec = l2norm_fwd(key_non_spec)
+            query_non_spec, key_non_spec = l2norm_fwd_fused(query_non_spec, key_non_spec)
             # Dispatches to the vllm-ascend AscendC custom operator
             # (csrc/recurrent_gated_delta_rule), NOT the built-in CANN operator.
             core_attn_out_non_spec = torch.ops._C_ascend.npu_recurrent_gated_delta_rule(
