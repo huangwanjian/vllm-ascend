@@ -52,6 +52,7 @@ def recompute_w_u_fwd_kernel(
             T = eos - bos
         else:
             bos, eos = i_b * T, i_b * T + T
+            i_t = i_t_o
 
         offs_t = tl.arange(0, BT)
         global_offs_t = i_t * BT + offs_t
@@ -112,8 +113,8 @@ def recompute_w_u_fwd(
         chunk_indices = prepare_chunk_indices(cu_seqlens, BT)
     NT = triton.cdiv(T, BT) if cu_seqlens is None else len(chunk_indices)
 
-    BK = 64
-    BV = 64
+    BK = 128
+    BV = 128
 
     u = torch.empty_like(v)
     w = k.new_empty(B, T, H, K)
