@@ -18,7 +18,7 @@ import torch
 from vllm.triton_utils import triton
 
 # Default chunk size used across FLA Triton kernels.
-FLA_CHUNK_SIZE = 64
+FLA_CHUNK_SIZE = 128
 
 
 def tensor_cache(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:

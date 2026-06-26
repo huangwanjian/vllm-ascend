@@ -1068,7 +1068,7 @@ def chunk_gla_fwd_o_gk(
     scale: float,
     cu_seqlens: torch.Tensor | None = None,
     chunk_indices: torch.Tensor | None = None,
-    chunk_size: int = 64,
+    chunk_size: int = 128,
 ):
     B, T, H, K, V = *q.shape, v.shape[-1]
     BT = chunk_size

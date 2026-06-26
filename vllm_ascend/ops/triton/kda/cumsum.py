@@ -32,7 +32,7 @@ def chunk_local_cumsum_scalar_kernel(
     HAS_SCALE: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     HEAD_FIRST: tl.constexpr,
-    CHUNK_SIZE: tl.constexpr = 64,
+    CHUNK_SIZE: tl.constexpr = 128,
 ):
     i_block, i_b = tl.program_id(0), tl.program_id(1)
     N_CHUNKS: tl.constexpr = BLOCK_T // CHUNK_SIZE

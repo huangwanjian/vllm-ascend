@@ -345,7 +345,7 @@ def test_build_chunk_meta_device_rejects_non_npu_input():
     with pytest.raises(ValueError, match="must be on NPU"):
         build_chunk_meta_device(
             cu_seqlens=cu_seqlens,
-            chunk_size=64,
+            chunk_size=128,
             out_chunk_indices=torch.empty((2, 2), dtype=torch.int32),
         )
 

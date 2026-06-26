@@ -46,7 +46,7 @@ def chunk_gated_delta_rule_fwd(
         attn_metadata = next(iter(attn_metadata.values()), None)
     if attn_metadata is not None:
         num_decodes = attn_metadata.num_decodes
-    chunk_size = 64
+    chunk_size = 128
     block_indices_cumsum = None if prebuilt_meta is None else prebuilt_meta.block_indices_cumsum
     cu_seqlens_host = None if prebuilt_meta is None else prebuilt_meta.cu_seqlens_host
     chunk_indices_chunk64 = None if prebuilt_meta is None else prebuilt_meta.chunk_indices_chunk64
@@ -107,7 +107,7 @@ def chunk_gated_delta_rule_fwd(
         gk=None,
         initial_state=initial_state,
         output_final_state=True,
-        chunk_size=64,
+        chunk_size=128,
         save_new_value=True,
         cu_seqlens=cu_seqlens_host,
         chunk_indices=chunk_indices_chunk64_host,
@@ -182,7 +182,7 @@ def chunk_gated_delta_rule_fwd(
         g_gamma=None,
         cu_seqlens=cu_seqlens_host,
         chunk_indices=chunk_indices_chunk64_host,
-        chunk_size=64,
+        chunk_size=128,
         transpose_state_layout=False,
     )
 

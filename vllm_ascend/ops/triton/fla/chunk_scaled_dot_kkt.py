@@ -93,7 +93,7 @@ def chunk_scaled_dot_kkt_fwd(
     g_cumsum: torch.Tensor | None = None,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.Tensor | None = None,
-    chunk_size: int = 64,
+    chunk_size: int = 128,
     output_dtype: torch.dtype = torch.float32,
 ) -> torch.Tensor:
     r"""

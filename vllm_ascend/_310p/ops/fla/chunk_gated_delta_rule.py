@@ -22,7 +22,7 @@ import torch.nn.functional as F
 
 from vllm_ascend._310p.ops.fla.l2norm import l2norm_310p
 
-CHUNK_SIZE = 64
+CHUNK_SIZE = 128
 
 
 def _expand_qk_to_v_heads(x: torch.Tensor, num_v_heads: int) -> torch.Tensor:

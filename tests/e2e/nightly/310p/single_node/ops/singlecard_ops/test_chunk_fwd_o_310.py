@@ -8,7 +8,7 @@ import torch_npu  # noqa: F401
 
 from vllm_ascend.utils import enable_custom_op
 
-CHUNK_SIZE = 64
+CHUNK_SIZE = 128
 
 
 def npu_chunk_fwd_o(q, k, v, h, g, scale):
