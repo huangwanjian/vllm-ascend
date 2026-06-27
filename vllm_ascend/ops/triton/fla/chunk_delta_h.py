@@ -183,7 +183,7 @@ def chunk_gated_delta_rule_fwd_h(
     g: torch.Tensor | None = None,
     initial_state: torch.Tensor | None = None,
     output_final_state: bool = False,
-    chunk_size: int = 128,  # SY: remove this argument and force chunk size 128?
+    chunk_size: int = 64,  # SY: remove this argument and force chunk size 64?
     save_new_value: bool = True,
     cu_seqlens: torch.LongTensor | None = None,
     chunk_indices: torch.Tensor | None = None,

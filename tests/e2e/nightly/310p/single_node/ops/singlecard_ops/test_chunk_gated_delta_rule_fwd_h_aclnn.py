@@ -9,10 +9,10 @@ import torch_npu  # noqa: F401
 
 from vllm_ascend.utils import enable_custom_op
 
-CHUNK_SIZE = 128
+CHUNK_SIZE = 64
 
 
-def npu_chunk_gdr_fwd_h(k, w, u, g, initial_state=None, chunk_size=128):
+def npu_chunk_gdr_fwd_h(k, w, u, g, initial_state=None, chunk_size=64):
     enable_custom_op()
     return torch.ops._C_ascend.chunk_gated_delta_rule_fwd_h(
         k,
@@ -26,7 +26,7 @@ def npu_chunk_gdr_fwd_h(k, w, u, g, initial_state=None, chunk_size=128):
     )
 
 
-def cpu_reference(k, w, u, g, initial_state=None, chunk_size=128):
+def cpu_reference(k, w, u, g, initial_state=None, chunk_size=64):
     """CPU fp32 reference matching kernel semantics."""
     k, w, u, g = k.float(), w.float(), u.float(), g.float()
     B, Hg, T, K = k.shape

@@ -37,7 +37,7 @@ from vllm_ascend.ops.triton.gdn_chunk_meta import (
     build_chunk_meta_device,
 )
 
-_GDN_CHUNK_SIZE = 128
+_GDN_CHUNK_SIZE = 64
 # Keep this aligned with solve_tril.LARGE_BLOCK_T in ops/triton/fla/solve_tril.py.
 _GDN_SOLVE_TRIL_LARGE_BLOCK_SIZE = 608 * 2
 _GDN_CUMSUM_WORKING_SET = 2**18

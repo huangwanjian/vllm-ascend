@@ -223,9 +223,3 @@ csrc/third_party/
 .codegraph/
 
 .vllm_ascend/
-
-# temp directory for scratch scripts
-temp/
-
-# root-level markdown files
-*.md

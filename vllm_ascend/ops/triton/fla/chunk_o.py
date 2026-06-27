@@ -117,7 +117,7 @@ def chunk_fwd_o(
     g: torch.Tensor | None = None,
     scale: float | None = None,
     cu_seqlens: torch.LongTensor | None = None,
-    chunk_size: int = 128,
+    chunk_size: int = 64,
     chunk_offsets: torch.Tensor | None = None,
 ) -> torch.Tensor:
     B, T, Hg, K, V = *q.shape, v.shape[-1]
