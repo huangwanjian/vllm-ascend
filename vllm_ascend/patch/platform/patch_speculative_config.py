@@ -39,7 +39,23 @@ def _update_dspark(config_dict: dict, pre_trained_config: dict) -> None:
         "mask_token_id": config_dict["mask_token_id"],
         "target_layer_ids": [i - 1 for i in aux_layer_ids],
     }
-    pre_trained_config["sample_from_anchor"] = config_dict.get("sample_from_anchor", False)
+    #pre_trained_config["sample_from_anchor"] = config_dict.get("sample_from_anchor", False)
+    # ---- Ascend patch: keep both anchor-layout keys in sync ----------------
+    # Upstream update_dspark() hardcodes `dspark_bonus_anchor = True`, and the
+    # two model runners read *different* keys for the same decision:
+    #   MRV1 AscendDSparkProposer : hf_config.sample_from_anchor
+    #                               (num_query_per_req = K when True)
+    #   MRV2 DSparkSpeculator     : not hf_config.dspark_bonus_anchor
+    #                               (num_query_per_req = 1 + K when False)
+    # Speculators trains DSpark with sample_from_anchor=True by default
+    # (models/dflash/core.py: default_sample_from_anchor = algorithm == "dspark"),
+    # so a checkpoint that declares True gets K slots on MRV1 but 1+K slots on
+    # MRV2 -- a block layout mismatch that silently destroys the draft model's
+    # acceptance rate. Derive both keys from the checkpoint.
+    sample_from_anchor = config_dict.get("sample_from_anchor", False)
+    pre_trained_config["sample_from_anchor"] = sample_from_anchor
+    pre_trained_config["dspark_bonus_anchor"] = not sample_from_anchor
+    # -----------------------------------------------------------------------
 
 
 speculator_algos.SUPPORTED_SPECULATORS_TYPES["dspark"] = _update_dspark
@@ -64,7 +80,7 @@ def hf_config_override(hf_config: PretrainedConfig) -> PretrainedConfig:
                 updates[name] = value
         hf_config.update(updates)
 
-    if hf_config.model_type in ("deepseek_v3", "deepseek_v32", "deepseek_v4", "glm_moe_dsa"):
+    if hf_config.model_type in ("deepseek_v3", "deepseek_v32", "deepseek_v4", "glm_moe_dsa", "xing4_0"):
         target_model_type = hf_config.model_type
         hf_config.model_type = "deepseek_mtp"
     if hf_config.model_type == "deepseek_mtp":
