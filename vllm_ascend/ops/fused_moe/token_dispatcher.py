@@ -20,6 +20,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import os
 from abc import ABC, abstractmethod
 from typing import Generic
 
@@ -55,6 +56,41 @@ from vllm_ascend.utils import (
 
 EXPERT_TOKEN_NUMS_TYPE_CUMSUM = 0
 EXPERT_TOKEN_NUMS_TYPE_COUNT = 1
+
+
+def _moe_routing_init_fusable(
+    hidden_states: torch.Tensor,
+    topk_ids: torch.Tensor,
+    expert_map,
+    with_quant: bool,
+    dynamic_scale,
+    apply_router_weight_on_input: bool,
+    global_redundant_expert_num: int,
+) -> bool:
+    """MoeRoutingInitFused（decode 小批量 MoE 派发融合）路径判定。
+
+    env VLLM_ASCEND_MOE_ROUTING_INIT_FUSED=1 显式开启（PoC 阶段默认关，整机验证后翻默认）。
+    命中时一次 launch 替代 npu_moe_init_routing_v2 + torch.abs(row_idx) +
+    expert_tokens.to(int64) 三个 kernel，输出契约与 CANN 路径逐字段一致。
+    条件：EP=1（无 expert_map）、非量化派发、无 per-token scale、无 router weight
+    前置乘、无 EPLB 冗余专家、topk_ids 为 int32、hidden 为 bf16、active_num = tokens*topk <= 64
+    （大 batch 前述回退 CANN 原路径）。"""
+    if os.getenv("VLLM_ASCEND_MOE_ROUTING_INIT_FUSED", "0") != "1":
+        return False
+    if expert_map is not None or with_quant or dynamic_scale is not None:
+        return False
+    if apply_router_weight_on_input or global_redundant_expert_num != 0:
+        return False
+    if topk_ids.dtype != torch.int32:
+        return False
+    if hidden_states.dtype != torch.bfloat16:
+        # 算子 def 仅注册 bf16（Xing4.0 decode 路径），其他 dtype 走 CANN 原路径
+        return False
+    if hidden_states.dim() != 2:
+        return False
+    # 上限 64（S<=16）：纯 decode 步走融合；混批步（chunked prefill 混入，S 大）
+    # 与大 S 回退 CANN——整模型 A/B 实测混批步 fused 0.93x 劣于 CANN，会拖累 p90 尾
+    return hidden_states.shape[0] * topk_ids.shape[-1] <= 64
 
 
 def _get_expert_token_nums_type(token_dispatch_input: MoETokenDispatchInput) -> int:
@@ -397,6 +433,36 @@ class TokenDispatcherWithAllGather(MoETokenDispatcher[MoEAllGatherCombineMetadat
             _, topk = topk_weights.shape
             assert topk == 1, "Only support topk=1 when `apply_router_weight_on_input` is True"
             hidden_states = hidden_states * topk_weights.to(hidden_states.dtype)
+        if _moe_routing_init_fusable(
+            hidden_states,
+            topk_ids,
+            expert_map,
+            with_quant,
+            dynamic_scale,
+            apply_router_weight_on_input,
+            global_redundant_expert_num,
+        ):
+            # decode 小批量派发融合：initrouting + 非负 row_idx + int64 expert_tokens
+            # 三合一（topk_weights 纯透传），消 3 个 kernel 与相应 launch 间隙
+            sorted_hidden_states, expanded_row_idx, expert_tokens, topk_weights_fused = (
+                DeviceOperator.moe_routing_init_fused(
+                    hidden_states,
+                    topk_ids,
+                    topk_weights,
+                    expert_num=self.num_experts_local,
+                )
+            )
+            return MoETokenDispatchOutput(
+                hidden_states=sorted_hidden_states,
+                dynamic_scale=None,
+                group_list=expert_tokens,  # 已 int64
+                group_list_type=1,  # `count` mode
+                combine_metadata=MoEAllGatherCombineMetadata(
+                    topk_weights=topk_weights_fused,
+                    expanded_row_idx=expanded_row_idx,
+                    restore_shape=restore_shape,
+                ),
+            )
         if expert_map is not None:
             global_num_experts = len(expert_map) + global_redundant_expert_num
             mask = expert_map[topk_ids] != -1

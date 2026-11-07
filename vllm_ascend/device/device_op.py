@@ -173,6 +173,25 @@ class BaseDeviceAdaptor:
         return topk_weights, topk_ids.to(torch.int32), out
 
     @staticmethod
+    def moe_routing_init_fused(
+        hidden_states,
+        topk_ids,
+        topk_weights,
+        *,
+        expert_num: int,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """MoeRoutingInitFused：decode 小批量 MoE 派发融合
+        （initrouting + 非负 row_idx + int64 expert_tokens 三合一）。
+        topk_weights 与 hidden 同 dtype 纯透传。调用前须过
+        _moe_routing_init_fusable gate（token_dispatcher.py）。"""
+        return torch.ops._C_ascend.moe_routing_init_fused(
+            hidden_states,
+            topk_ids,
+            topk_weights,
+            expert_num=expert_num,
+        )
+
+    @staticmethod
     def npu_mm_reduce_scatter_base(
         x1: torch.Tensor,
         x2: torch.Tensor,
