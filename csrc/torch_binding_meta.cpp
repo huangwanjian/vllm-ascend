@@ -430,6 +430,38 @@ std::tuple<at::Tensor,at::Tensor, at::Tensor> moe_gating_top_k_meta(
     return std::tuple<at::Tensor, at::Tensor, at::Tensor>(y,expert_idx,out);
 }
 
+std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor> moe_routing_init_fused_meta(
+    const at::Tensor& hidden,
+    const at::Tensor& topk_ids,
+    const at::Tensor& topk_weights,
+    int64_t expert_num)
+{
+    TORCH_CHECK(hidden.dim() == 2, "The hidden should be 2D");
+    TORCH_CHECK(topk_ids.dim() == 2, "The topk_ids should be 2D");
+    TORCH_CHECK(topk_weights.dim() == 2, "The topk_weights should be 2D");
+    TORCH_CHECK(topk_ids.scalar_type() == at::kInt, "The topk_ids should be int32");
+    TORCH_CHECK(topk_weights.scalar_type() == hidden.scalar_type(),
+                "The topk_weights should have the same dtype as hidden (pass-through)");
+    TORCH_CHECK(expert_num > 0, "expert_num should be positive");
+
+    auto tokenNum = hidden.sym_size(0);
+    auto cols = hidden.sym_size(1);
+    auto k = topk_ids.sym_size(1);
+    TORCH_CHECK(topk_ids.sym_size(0) == tokenNum && topk_weights.sym_size(0) == tokenNum &&
+                    topk_weights.sym_size(1) == k,
+                "topk_ids/topk_weights shape mismatch with hidden");
+
+    auto activeNum = tokenNum * k;
+    at::Tensor sorted_hidden =
+        at::empty_symint(c10::SymDimVector{activeNum, cols}, hidden.options());
+    at::Tensor expanded_row_idx = at::empty_symint(c10::SymDimVector{activeNum}, hidden.options().dtype(at::kInt));
+    at::Tensor expert_tokens = at::empty_symint(c10::SymDimVector{c10::SymInt(expert_num)}, hidden.options().dtype(at::kLong));
+    at::Tensor topk_weights_out = topk_weights; // 纯透传别名
+
+    return std::tuple<at::Tensor, at::Tensor, at::Tensor, at::Tensor>(sorted_hidden, expanded_row_idx,
+                                                                      expert_tokens, topk_weights_out);
+}
+
 std::tuple<at::Tensor,at::Tensor, at::Tensor> npu_add_rms_norm_bias_meta(
     const at::Tensor& x1,
     const at::Tensor& x2,
@@ -2071,6 +2103,8 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("dispatch_ffn_combine", &vllm_ascend::meta::dispatch_ffn_combine_meta);
     // Moe_gating_top_k
     ops.impl("moe_gating_top_k", &vllm_ascend::meta::moe_gating_top_k_meta);
+    // Moe_routing_init_fused (decode 小批量 MoE 派发融合)
+    ops.impl("moe_routing_init_fused", &vllm_ascend::meta::moe_routing_init_fused_meta);
     // Add_Rms_Norm_Bias
     ops.impl("npu_add_rms_norm_bias", &vllm_ascend::meta::npu_add_rms_norm_bias_meta);
     // transpose_kv_cache_by_block

@@ -38,6 +38,7 @@
 #include "gmm/grouped_matmul_swiglu_quant_v2/grouped_matmul_swiglu_quant_v2_torch_adpt.h"
 #include "attention/lightning_indexer/lightning_indexer_torch_adpt.h"
 #include "moe/moe_gating_top_k/moe_gating_top_k_torch_adpt.h"
+#include "moe/moe_routing_init_fused/moe_routing_init_fused_torch_adpt.h"
 #include "attention/sparse_flash_attention/sparse_flash_attention_torch_adpt.h"
 #include "attention/kv_quant_sparse_flash_attention/kv_quant_sparse_flash_attention_torch_adpt.h"
 #include "attention/lightning_indexer_quant/lightning_indexer_quant_torch_adpt.h"
@@ -2722,6 +2723,16 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "-> (Tensor y ,Tensor expert_idx, Tensor out)"
         );
     ops.impl("moe_gating_top_k", torch::kPrivateUse1,&vllm_ascend::moe_gating_top_k);
+
+    ops.def(
+        "moe_routing_init_fused(Tensor hidden, "
+                            "Tensor topk_ids, "
+                            "Tensor topk_weights, "
+                            "int expert_num)"
+
+        "-> (Tensor sorted_hidden, Tensor expanded_row_idx, Tensor expert_tokens, Tensor topk_weights_out)"
+        );
+    ops.impl("moe_routing_init_fused", torch::kPrivateUse1,&vllm_ascend::moe_routing_init_fused);
 
     ops.def(
         "npu_add_rms_norm_bias(Tensor x1, "
