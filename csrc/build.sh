@@ -1606,6 +1606,16 @@ elif [[ "$ENABLE_BUILT_CUSTOM" == "TRUE" ]]; then      # --ops, --vendor 新命�
         cmake_config " -DENABLE_BUILD_PKG=OFF"
     fi
     build_package
+    if [[ "${ops_kernel_value}" == "ON" ]]; then
+        # 编译引擎代差修复：部分算子（MhcPreClampSinkhorn）的 kernel 需用 CANN fwk
+        # 引擎（asc_op_compile_base）重编覆盖——vendored 编译脚本驱动的老 tbe.tikcpp
+        # 引擎对其 tiny fork 路径产出数值错误二进制。重编覆盖同名产物后重新打包。
+        # 详见 scripts/util/compile_fwk_kernel.py 头部说明。
+        if ! python3 ${CURRENT_DIR}/scripts/util/compile_fwk_kernel.py; then
+            echo "[ERROR] fwk engine kernel recompile failed!" && exit 1
+        fi
+        build_package
+    fi
 elif [[ "$ENABLE_BUILD_PKG" == "TRUE" ]]; then      # --pkg 新命令新使用
     IFS=';' read -ra SOC_ARRAY <<< "$ASCEND_SOC_UNITS"  # 分割字符串为数组
     CUSTOM_OPTION="${CUSTOM_OPTION} -DENABLE_BUILD_PKG=ON"
