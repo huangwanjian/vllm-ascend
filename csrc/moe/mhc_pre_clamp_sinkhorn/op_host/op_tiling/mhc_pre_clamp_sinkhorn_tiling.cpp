@@ -142,6 +142,46 @@ int GetTinyBsModeOverride()
     return TINY_MODE_AUTO;
 }
 
+// Env override for A/B validation: MHC_PRE_TINY_FORK = on | off(default).
+// 仅作用于 key=2 tiny 路由：on 时 Part2 把 hin 支 / res 支 fork 到两半 AIV 并行
+//（tiny_core.h 的 MhcPreClampSinkhornTinyPart2::ProcessFork）；off 与串行链逐位一致。
+// 非 tiny 路由（key=0/1）恒 off，对应 kernel 不读该字段。
+constexpr int TINY_FORK_MODE_OFF = 0;
+constexpr int TINY_FORK_MODE_ON = 1;
+int GetTinyForkOverride()
+{
+    const char *mode = getenv("MHC_PRE_TINY_FORK");
+    if (mode == nullptr) {
+        return TINY_FORK_MODE_OFF;
+    }
+    std::string modeStr(mode);
+    if (modeStr == "on" || modeStr == "1") {
+        return TINY_FORK_MODE_ON;
+    }
+    return TINY_FORK_MODE_OFF;
+}
+
+// Env override for A/B validation: MHC_PRE_TINY_FUSE = on | off(default).
+// 仅作用于 key=2 tiny 路由：on 时 AIV 把 Part2 的 prologue（pipe2 ctor+Init、
+// hcBase/hcScale 常量 CopyIn、fork A 支 x 首块预取）前置到 Part1 尾部 SyncAll
+// 等待阴影里，SyncAll 外提到入口（tiny_core.h 的 PrologueFuse 路径）；
+// off 与原路径逐位一致。非 tiny 路由（key=0/1）恒 off，对应 kernel 不读该字段。
+// 与 MHC_PRE_TINY_FORK 正交：目标档 fuse=on + fork=on，两旋钮可独立 A/B。
+constexpr int TINY_FUSE_MODE_OFF = 0;
+constexpr int TINY_FUSE_MODE_ON = 1;
+int GetTinyFuseOverride()
+{
+    const char *mode = getenv("MHC_PRE_TINY_FUSE");
+    if (mode == nullptr) {
+        return TINY_FUSE_MODE_OFF;
+    }
+    std::string modeStr(mode);
+    if (modeStr == "on" || modeStr == "1") {
+        return TINY_FUSE_MODE_ON;
+    }
+    return TINY_FUSE_MODE_OFF;
+}
+
 // Stage2 row blocking: how many 4x4 Sinkhorn matrices one vector pass covers.
 // The Sinkhorn body is dominated by per-iteration scalar/issue overhead when
 // rowFactor==1 (large d exhausts UB and leaves no room for more rows), so a
@@ -488,6 +528,13 @@ ge::graphStatus MhcPreClampSinkhornTiling::CalcOpTiling()
             aivCoreNum_ = tinyBlocks * TINY_CV_RATIO;
         }
     }
+    // tiny Part2 fork 双支旋钮落 tiling（BRIEF-tiny-fork）：默认 off；on 需 tiny 路由成立。
+    tinyForkOn_ = tinyRoute_ && (GetTinyForkOverride() == TINY_FORK_MODE_ON);
+    tilingData_.set_tinyFork(tinyForkOn_ ? 1 : 0);
+    // tiny 融合旋钮落 tiling（BRIEF-tiny-fuse）：默认 off；on 需 tiny 路由成立。
+    // 与 fork 正交：fuse 只搬 prologue/外提 SyncAll，不触碰 fork 的行布局与计算链。
+    tinyFuseOn_ = tinyRoute_ && (GetTinyFuseOverride() == TINY_FUSE_MODE_ON);
+    tilingData_.set_tinyFuse(tinyFuseOn_ ? 1 : 0);
     uint64_t kSize = hcMult_ * d_;
     tilingData_.set_k(kSize);
     // 切K计算stage1
@@ -663,6 +710,8 @@ static void PrintTilingData(const gert::TilingContext* context, MhcPreClampSinkh
     OP_LOGD(context->GetNodeName(), "MhcPreClampSinkhorn_tiling: stage1NcFactor is %ld.", tiling.get_stage1NcFactor());
     OP_LOGD(context->GetNodeName(), "MhcPreClampSinkhorn_tiling: stage1TailNcFactor is %ld.", tiling.get_stage1TailNcFactor());
     OP_LOGD(context->GetNodeName(), "MhcPreClampSinkhorn_tiling: stage1XCastWsSize is %ld.", tiling.get_stage1XCastWsSize());
+    OP_LOGD(context->GetNodeName(), "MhcPreClampSinkhorn_tiling: tinyFork is %ld.", tiling.get_tinyFork());
+    OP_LOGD(context->GetNodeName(), "MhcPreClampSinkhorn_tiling: tinyFuse is %ld.", tiling.get_tinyFuse());
 }
 
 ge::graphStatus MhcPreClampSinkhornTiling::CalcStage1Tiling()
@@ -795,10 +844,11 @@ ge::graphStatus MhcPreClampSinkhornTiling::PostTiling()
     if (tinyRoute_) {
         OP_LOGI(context_->GetNodeName(),
                 "MhcPreClampSinkhorn route: bs=%ld needGrad=%d cubeBlockDimK=%ld tiny=on "
-                "-> tilingKey=2 launch(aiv=%lu aic=%lu) platform(aiv=%lu aic=%lu)",
+                "-> tilingKey=2 launch(aiv=%lu aic=%lu) platform(aiv=%lu aic=%lu) fork=%s fuse=%s",
                 bs_, static_cast<int>(needGrad_), tilingData_.get_cubeBlockDimK(),
                 static_cast<unsigned long>(aivCoreNum_), static_cast<unsigned long>(aicCoreNum_),
-                static_cast<unsigned long>(platAivCoreNum_), static_cast<unsigned long>(platAicCoreNum_));
+                static_cast<unsigned long>(platAivCoreNum_), static_cast<unsigned long>(platAicCoreNum_),
+                tinyForkOn_ ? "on" : "off", tinyFuseOn_ ? "on" : "off");
     } else {
         OP_LOGI(context_->GetNodeName(),
                 "MhcPreClampSinkhorn route: bs=%ld needGrad=%d cubeBlockDimK=%ld kDimSplit=%s tiny=off "

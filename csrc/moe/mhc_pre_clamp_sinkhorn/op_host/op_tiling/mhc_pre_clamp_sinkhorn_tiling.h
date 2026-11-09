@@ -133,6 +133,16 @@ TILING_DATA_FIELD_DEF(int64_t, stage1XCastWsSize);        // X_cast workspace �
 TILING_DATA_FIELD_DEF_STRUCT(TCubeTiling, mm1TilingData)
 TILING_DATA_FIELD_DEF(float, clamp_min)
 TILING_DATA_FIELD_DEF(float, clamp_max)
+// key=2 tiny Part2 fork 双支开关（env MHC_PRE_TINY_FORK，默认 off）。
+// 仅 tiny 路由（tilingKey=2）的 kernel 读它；key=0/1 与 arch35 kernel 不读。追加在
+// 结构体末尾，既有字段偏移不变。
+TILING_DATA_FIELD_DEF(int64_t, tinyFork)
+// key=2 tiny 融合开关（env MHC_PRE_TINY_FUSE，默认 off）：AIV 把 Part2 的 prologue
+//（pipe2 Init + hcBase/hcScale 常量 + fork A 支 x 首块预取）前置到 Part1 尾部
+// SyncAll 等待阴影里（方案 perf/TINY_FUSE_DESIGN.md §3 路径 A'）。仅 tiny 路由
+//（tilingKey=2）成立时置位；key=0/1 与 arch35 恒 0，kernel 侧仅 key=2 分支读。
+// 追加式：既有字段（含 tinyFork）偏移不变。
+TILING_DATA_FIELD_DEF(int64_t, tinyFuse)
 END_TILING_DATA_DEF;
 
 REGISTER_TILING_DATA_CLASS(MhcPreClampSinkhorn, MhcPreClampSinkhornTilingData)
@@ -201,6 +211,10 @@ private:
     // k-split core counts to a small launch (TINY_K_SPLIT_AIC) so the fixed
     // launch/sync/Init tax of a full 60-core launch stops dominating the ~2us of math.
     bool tinyRoute_ = false;
+    // tiny Part2 fork 双支（MHC_PRE_TINY_FORK）是否启用：key=2 专用 A/B 旋钮
+    bool tinyForkOn_ = false;
+    // tiny 融合（MHC_PRE_TINY_FUSE）是否启用：key=2 专用 A/B 旋钮（prologue 前置）
+    bool tinyFuseOn_ = false;
     // platform-queried counts stashed before the tiny override, for the route log
     // (910C deployment checks core-count adaptivity via this log line).
     uint64_t platAivCoreNum_ = 0;

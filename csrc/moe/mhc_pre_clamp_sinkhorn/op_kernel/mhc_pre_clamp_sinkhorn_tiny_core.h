@@ -18,6 +18,12 @@
  *    整个 A/B 切片一次性驻留 L1，从结构上绕开 key=1 的多轮双缓冲事件协议（B<=8 挂死区）
  *  - 内层 MMAD 块 K_L0_TINY=256（key=1 为 32）：Kslice=1792 时块数 56->7，砍 AIC scalar
  *  - Part2 fork 删除全部 needGrad 分支（路由保证推理路径）
+ *  - Part2 fork 双支（MHC_PRE_TINY_FORK=on，A/B 旋钮）：A 支 hin 链 / B 支 res 链
+ *    各领一半 AIV 并行；off 保持串行链逐位一致（见 ProcessFork 注释）
+ *  - 融合（MHC_PRE_TINY_FUSE=on，A/B 旋钮，方案 perf/TINY_FUSE_DESIGN.md §3 路径 A'）：
+ *    AIV 把 Part2 prologue（pipe2 ctor+Init、hcBase/hcScale 常量、fork A 支 x 首块
+ *    预取）前置到 Part1 尾部 SyncAll 等待阴影，SyncAll 外提到入口；off 逐位一致。
+ *    与 fork 正交（fuse 只搬 prologue，不碰行布局/WS/计算序）
  * 输出契约（WS 布局 mmOut[kcore][bs][128] / squareSum[kcore][align16(bs)][16]）与 key=1
  * 完全一致，Part2 的合并/epilogue 数学逐行同源。
  */
@@ -408,7 +414,10 @@ public:
         pipe->InitBuffer(mmInQue, NUM_TWO, xQueNum * sizeof(float));
     }
 
-    __aicore__ inline void Process(int64_t bsOffset, int64_t curBs)
+    // deferTailSync（MHC_PRE_TINY_FUSE=on 专用）：true 时跳过 AIV 尾部双 Wait 与
+    // 尾部 SyncAll——由入口在 pipe2 prologue 之后显式补（WaitAivTailFlags + SyncAll），
+    // 使 prologue 落进 barrier 等待阴影。off 路径恒走默认 false，逐行原行为。
+    __aicore__ inline void Process(int64_t bsOffset, int64_t curBs, bool deferTailSync = false)
     {
         int64_t curML1Size = tilingData->mL1Size;
         int64_t curCubeBlockDimM = tilingData->cubeBlockDimM;
@@ -494,13 +503,46 @@ public:
         }
         if ASCEND_IS_AIC {
             cubeCompute_.End();
-        } else {
+        } else if (!deferTailSync) {
             CrossCoreWaitFlag(SYNC_AIC_TO_AIV_FLAG);
             CrossCoreWaitFlag(SYNC_AIC_TO_AIV_FLAG);
         }
         // SyncAll 必须保留：Part2 要读全部 8 个 AIC 的 partial，上方成对 flag 只保证
-        // 本对 AIC->AIV 的顺序性，不提供跨对 GM 可见性（key=1 实证同款承重墙）
-        SyncAll<false>();
+        // 本对 AIC->AIV 的顺序性，不提供跨对 GM 可见性（key=1 实证同款承重墙）。
+        // fuse=on 时由入口在 AIV prologue 之后统一调用（位置后移，到达序不变）。
+        if (!deferTailSync) {
+            SyncAll<false>();
+        }
+    }
+
+    // fuse=on 入口专用（与 Process 尾部双 Wait 为同一对指令，仅位置后置到 prologue
+    // 之后）：flag 记账平衡不变——AIC 预置 2 次 + 循环内 1 次 Set，AIV 消费 1（循环
+    // 内）+2（此处）。AIC 侧无尾部 Wait，恒 no-op。
+    __aicore__ inline void WaitAivTailFlags()
+    {
+        if ASCEND_IS_AIV {
+            CrossCoreWaitFlag(SYNC_AIC_TO_AIV_FLAG);
+            CrossCoreWaitFlag(SYNC_AIC_TO_AIV_FLAG);
+        }
+    }
+
+    // fuse=on 入口专用：等本核 MTE3 队列排空（Part1 的 xCastLocal->WS CopyOut 读源
+    // 仍可能在飞），防护 pipe2 的 UB 覆写与 in-flight MTE3 读重叠地址（方案 §3
+    // 要点 3，简报硬约束 4）。两对事件分别覆盖后续的两类 pipe2 写：
+    //   MTE3->MTE2：PrologueFuse 的 hcBase/hcScale/x CopyIn（MTE2 写）
+    //   MTE3->V   ：op2.Init 的 SetGatherMaskPattern（Duplicate 写掩码表，V 写），
+    //               复用 base.h MTE3ToVSync（与 key=0/1 的 CopyOut 后防覆写同款，
+    //               亦与 CANN TPipe::WriteSpmBuffer 的双事件对一致）
+    // 必须在 pipe.Destroy() 之前调用（FetchEventID 依赖当前 TPipe 存活）。AIC 无
+    // MTE3 且不做 prologue，恒 no-op（AIC 的 DataCopyCO12 走 FIX 管线，不受影响）。
+    __aicore__ inline void WaitMte3DrainForFuse()
+    {
+        if ASCEND_IS_AIV {
+            event_t evtDrain = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE3_MTE2));
+            SetFlag<HardEvent::MTE3_MTE2>(evtDrain);
+            WaitFlag<HardEvent::MTE3_MTE2>(evtDrain);
+            MTE3ToVSync();
+        }
     }
 
 private:
@@ -545,6 +587,10 @@ public:
     {
         pipe = pipePtr;
         tilingData = tilingDataPtr;
+        // fuse 旋钮（MHC_PRE_TINY_FUSE，tiling 字段 tinyFuse）：on 时 Process/ProcessFork
+        // 跳过常量 CopyIn（已由入口在 barrier 前的 PrologueFuse 前置），fork A 支首块
+        // x 由预取垫上。off 恒 false，走原路径。
+        fuseOn_ = (tilingData->tinyFuse != 0);
 
         xGm.SetGlobalBuffer((__gm__ T *)x + (bsOffset * tilingData->hcMult * tilingData->d));
         hcScaleGm.SetGlobalBuffer((__gm__ float *)hcScale);
@@ -605,6 +651,90 @@ public:
         SetGatherMaskPattern(maskPatternLocal);
     }
 
+    // ---- fuse 路径（MHC_PRE_TINY_FUSE=on）barrier 前 prologue（方案 §3 路径 A'）----
+    // 仅 AIV 调用（AIC 侧入口已关闭 pipe2 Init），且必须在 SyncAll 之前、
+    // TinyPart1::WaitMte3DrainForFuse + pipe1.Destroy 之后（MTE3 in-flight 防护）。
+    // v1：hcBase0/1/2 + hcScale 常量前置——与 off 串行链 Process 开头的四笔 CopyIn +
+    //      MTE2_V 事件对逐笔同源（on 路径的 Process/ProcessFork 相应跳过它们）。
+    //      三支所需常量统一前置（A 支 hcBase0/hcScale、B 支 hcBase1/2/hcScale、串行
+    //      全量），每核多搬 ~112B，换三处省一笔；hcBase/hcScale 为 GM 输入（kernel
+    //      内无人写），barrier 前读无竞争。
+    //      注意：此处只 SetFlag 不 WaitFlag——WaitFlag 会以 GM 读延迟（~1us 级）阻塞
+    //      AIV scalar、加深 pre-barrier 路径；把等待推迟到尾部双 Wait 之后
+    //      （WaitPrologueConsts），届时 flag 早已置位、瞬时通过。事件 ID 由
+    //      FetchEventID 取首个空闲位（TQue 的事件在 InitBuffer 时静态绑定，互不冲突）。
+    // v2：fork（tinyFork=1）A 支 x 首块预取——复刻 ProcessFork A 支 rowOuterIdx=0 的
+    //      首 d 块 AllocTensor+CopyIn+EnQue（tiny_core.h 原 899-902 手法），仅把位置
+    //      从 barrier 后提前到 barrier 前；dLoop>1 的后续块与 rowOuter 后续轮仍按
+    //      现状现场搬。串行链与 B 支不预取（B 支无 x 读）。支布局派生与 ProcessFork
+    //      逐行同源（不抽公共函数以保持 off 路径零改动，改此处须同步改 ProcessFork）。
+    __aicore__ inline void PrologueFuse(int64_t curBs)
+    {
+        CopyIn(hcBaseGm, hcBase0Local, 1, tilingData->hcMult);
+        CopyIn(hcBaseGm[tilingData->hcMult], hcBase1Local, 1, tilingData->hcMult);
+        CopyIn(hcBaseGm[tilingData->hcMult * NUM_TWO], hcBase2Local, tilingData->hcMult, tilingData->hcMult);
+        // 只拷实际 3 个元素，不做整块 32B 拷贝（避免越界读 hcScale 尾部）
+        CopyIn(hcScaleGm, hcScaleLocal, 1, 3);
+        // MTE2->V 事件：只挂不待（等待推迟到 WaitPrologueConsts，见上）
+        prologueConstEvt_ = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
+        SetFlag<HardEvent::MTE2_V>(prologueConstEvt_);
+
+        if (tilingData->tinyFork == 0) {
+            return; // v2 仅 fork A 支（设计 §3 要点 5）
+        }
+        // ---- v2: fork A 支 x 首块预取（支布局派生与 ProcessFork 同源）----
+        const int64_t branchAivNum = tilingData->cubeCoreNum;
+        int64_t stage2BlockIdx = GetBlockIdx();
+        int64_t branchIdx = stage2BlockIdx / branchAivNum;
+        int64_t branchBlockIdx = stage2BlockIdx % branchAivNum;
+        int64_t branchRowOfFormerBlock = (curBs + branchAivNum - 1) / branchAivNum;
+        {
+            // 行块向上取整到 2 的幂（GatherMaskByDiagonal 的 16 行对齐契约，同 ProcessFork）
+            int64_t pow2RowBlock = 1;
+            while (pow2RowBlock < branchRowOfFormerBlock) {
+                pow2RowBlock *= NUM_TWO;
+            }
+            branchRowOfFormerBlock = pow2RowBlock;
+        }
+        int64_t branchUsedCoreNum = (curBs + branchRowOfFormerBlock - 1) / branchRowOfFormerBlock;
+        if (branchUsedCoreNum > branchAivNum) {
+            branchUsedCoreNum = branchAivNum;
+        }
+        if (branchIdx != 0 || branchBlockIdx >= branchUsedCoreNum) {
+            return; // B 支 / A 支空核：无 x 读，不预取
+        }
+        int64_t branchRowOfTailBlock = curBs - (branchUsedCoreNum - 1) * branchRowOfFormerBlock;
+        bool isBranchTailBlock = (branchBlockIdx == branchUsedCoreNum - 1);
+        int64_t branchRowCount = isBranchTailBlock ? branchRowOfTailBlock : branchRowOfFormerBlock;
+        int64_t rowOuterLoop = (branchRowCount + tilingData->stage2RowFactor - 1) / tilingData->stage2RowFactor;
+        int64_t tailRowFactor = branchRowCount % tilingData->stage2RowFactor;
+        if (tailRowFactor == 0) {
+            tailRowFactor = tilingData->stage2RowFactor;
+        }
+        // rowOuterIdx=0 的首块参数（与 ProcessFork A 支循环首迭代逐字段同源）
+        int64_t firstDFactor = (tilingData->dLoop == 1) ? tilingData->tailDFactor : tilingData->dFactor;
+        int64_t firstRowFactor = (rowOuterLoop == 1) ? tailRowFactor : tilingData->stage2RowFactor;
+        int64_t xGmBlockBaseOffsetPart2 = branchBlockIdx * branchRowOfFormerBlock * tilingData->hcMult * tilingData->d;
+        xLocal = xQue.template AllocTensor<T>();
+        CopyIn(xGm[xGmBlockBaseOffsetPart2], xLocal, firstRowFactor * tilingData->hcMult, firstDFactor,
+               tilingData->d - firstDFactor);
+        xQue.template EnQue(xLocal);
+        xFirstBlockPrefetched_ = true; // ProcessFork A 支首迭代据此跳过同一笔搬运
+    }
+
+    // fuse 路径收尾（入口在 AIV 尾部双 Wait 之后、SyncAll 之前调用）：等 PrologueFuse
+    // 挂上的常量 MTE2->V 事件。尾部双 Wait 期间 MTE2 早已完成（阴影），此处瞬时通过，
+    // 保证 barrier 后 Process/ProcessFork 的 V 读与 GetValue 消费安全（与 off 路径
+    // CopyIn 后紧跟事件对的语义等价，仅等待时机后移）。
+    __aicore__ inline void WaitPrologueConsts()
+    {
+        if ASCEND_IS_AIV {
+            if (fuseOn_) {
+                WaitFlag<HardEvent::MTE2_V>(prologueConstEvt_);
+            }
+        }
+    }
+
     __aicore__ inline void Process(int64_t bsOffset, int64_t curBs)
     {
         int64_t curRowOfFormerBlock = tilingData->rowOfFormerBlock;
@@ -617,6 +747,11 @@ public:
         int64_t curML1Size = tilingData->mL1Size;
 
         if ASCEND_IS_AIV {
+            if (tilingData->tinyFork != 0) {
+                // fork 双支路径（MHC_PRE_TINY_FORK=on）：下方原串行链一行不动（off 逐位一致）
+                ProcessFork(curBs);
+                return;
+            }
             int64_t stage1UsedCoreNum = tilingData->cubeBlockDimK;
             int64_t stage2BlockIdx = GetBlockIdx();
             int64_t stage2UsedCoreNum = curSecondUsedCoreNum;
@@ -627,14 +762,18 @@ public:
             int64_t xCastFp32BufSize = curML1Size * CeilAlign(tilingData->cvLoopKSize, MM_CACHE_LINE_BYTES / sizeof(float)) * sizeof(float);
             int64_t workspaceSize1 = (tilingData->cubeCoreNum * DOUBLE_BUFFER * xCastFp32BufSize) / sizeof(float);
             int64_t workspaceSize2 = CeilAlign(stage1UsedCoreNum * curBs * mmLastAxisSize * sizeof(float), WORKSPACE_ALIGN_SIZE) / sizeof(float);
-            CopyIn(hcBaseGm, hcBase0Local, 1, tilingData->hcMult);
-            CopyIn(hcBaseGm[tilingData->hcMult], hcBase1Local, 1, tilingData->hcMult);
-            CopyIn(hcBaseGm[tilingData->hcMult * NUM_TWO], hcBase2Local, tilingData->hcMult, tilingData->hcMult);
-            // 只拷实际 3 个元素，不做整块 32B 拷贝（避免越界读 hcScale 尾部）
-            CopyIn(hcScaleGm, hcScaleLocal, 1, 3);
-            event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
-            SetFlag<HardEvent::MTE2_V>(eventId);
-            WaitFlag<HardEvent::MTE2_V>(eventId);
+            if (!fuseOn_) {
+                // fuse=on 时这四笔常量 CopyIn + MTE2_V 事件对已由入口 PrologueFuse 在
+                // barrier 前前置完成（逐笔同源），此处跳过省 critical path
+                CopyIn(hcBaseGm, hcBase0Local, 1, tilingData->hcMult);
+                CopyIn(hcBaseGm[tilingData->hcMult], hcBase1Local, 1, tilingData->hcMult);
+                CopyIn(hcBaseGm[tilingData->hcMult * NUM_TWO], hcBase2Local, tilingData->hcMult, tilingData->hcMult);
+                // 只拷实际 3 个元素，不做整块 32B 拷贝（避免越界读 hcScale 尾部）
+                CopyIn(hcScaleGm, hcScaleLocal, 1, 3);
+                event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
+                SetFlag<HardEvent::MTE2_V>(eventId);
+                WaitFlag<HardEvent::MTE2_V>(eventId);
+            }
 
             int64_t rowOuterLoop =
                 (stage2BlockIdx == stage2UsedCoreNum - 1) ? curRowLoopOfTailBlock : curRowLoopOfFormerBlock;
@@ -787,6 +926,326 @@ public:
         }
     }
 
+    // ---- fork 双支路径（MHC_PRE_TINY_FORK=on，BRIEF-tiny-fork）----
+    // pre/post/res/sinkhorn 三块数据独立（hin / post+combFrag 输出张量互不相交），
+    // 把 Part2 串行链 fork 到两半 AIV 并行：
+    //  - A 支（blockIdx 低半，hin 支）：rsqrt 重算 + pre 4 列 gather + ProcessPre +
+    //    dLoop 读 x / ProcessY / hin 输出。带宽长杆（读 (T,4,d) BF16），本支先按序挂
+    //    三个 MTE2 搬运（squareSum 小块 -> pre mix01 小块 -> 首块 x 大块），rsqrt/pre
+    //    计算垫在 x 搬运缝里（MTE2 按序执行，x 排在小 gather 之后不阻塞它们到达）。
+    //  - B 支（blockIdx 高半，res 支）：rsqrt 重算 + post 4 列 gather + ProcessPost +
+    //    post 输出 + res 16 列 gather + 缩放/bias + softmax + 20 轮 sinkhorn +
+    //    combFrag 输出。纯小数据延迟链，与 A 支抢的不是同类资源。
+    // 核分配/行布局在 kernel 内从现有字段派生（不新增 tiling 布局字段），理由：
+    // launch 形态固定 KERNEL_TYPE_MIX_AIC_1_2，AIV 总数 = 2*cubeCoreNum，每支领
+    // cubeCoreNum 个 AIV；行空间量（curBs/stage2RowFactor）与核数无关，支内行块公式
+    // CeilDiv(curBs, branchAivNum)、尾块行数、rowOuterLoop/tailRowFactor 与 host 侧
+    // 16 核布局（CalcMKSplitCoreMembasePart2Tiling）同源、仅把分母换成支内 AIV 数。
+    // rsqrt 不跨支共享：两支各自从 workspace squareSum 重算（量很小，避免跨支同步）。
+    // mix01 按支裁剪：A 支只拉 pre 那 4 列（原第一次 CopyInWithOuterFor），B 支只拉
+    // post 4 列（原第二次调用的源偏移 +hcMult，落位 mxies01Local[0]，dim0=1 单支归约），
+    // 谁也不拉 8 列全量。无 join：不加合流 flag/SyncAll，kernel 结束框架收尾。
+    __aicore__ inline void ProcessFork(int64_t curBs)
+    {
+        const int64_t stage1UsedCoreNum = tilingData->cubeBlockDimK;
+        int64_t curStage2RowFactor = tilingData->stage2RowFactor;
+        int64_t mmLastAxisSize = CeilAlign(tilingData->hcMix, MM_CACHE_LINE_BYTES / sizeof(float));
+        int64_t xCastFp32BufSize = tilingData->mL1Size *
+            CeilAlign(tilingData->cvLoopKSize, MM_CACHE_LINE_BYTES / sizeof(float)) * sizeof(float);
+        int64_t workspaceSize1 = (tilingData->cubeCoreNum * DOUBLE_BUFFER * xCastFp32BufSize) / sizeof(float);
+        int64_t workspaceSize2 = CeilAlign(stage1UsedCoreNum * curBs * mmLastAxisSize * sizeof(float),
+                                           WORKSPACE_ALIGN_SIZE) / sizeof(float);
+
+        // 支划分：AIV 低半 = A 支（hin），高半 = B 支（res）
+        const int64_t branchAivNum = tilingData->cubeCoreNum;
+        int64_t stage2BlockIdx = GetBlockIdx();
+        int64_t branchIdx = stage2BlockIdx / branchAivNum;
+        int64_t branchBlockIdx = stage2BlockIdx % branchAivNum;
+        // 支内行布局（行空间与 off 路径同一坐标定义）
+        int64_t branchRowOfFormerBlock = (curBs + branchAivNum - 1) / branchAivNum;
+        // 行块大小向上取整到 2 的幂（bs<=32 时为 1/2/4）：GatherMaskByDiagonal 的对角
+        // 掩码按 base%16 沿块内行号线性推进、不回绕，行块跨 16 行对齐边界会取错
+        // rsqrt 源（bs=20、行块=3 时 base=15 的块踩中该坑，行 16 结果偏移）。off 路径
+        // 行块恒为 16 的因子（1/2）天然不跨界；本支 CeilDiv 可能得 3，向上取齐。
+        // 取齐只会增大行块，CeilDiv(curBs, 行块) <= branchAivNum 仍恒成立（下界防护不触发）。
+        {
+            int64_t pow2RowBlock = 1;
+            while (pow2RowBlock < branchRowOfFormerBlock) {
+                pow2RowBlock *= NUM_TWO;
+            }
+            branchRowOfFormerBlock = pow2RowBlock;
+        }
+        int64_t branchUsedCoreNum = (curBs + branchRowOfFormerBlock - 1) / branchRowOfFormerBlock;
+        if (branchUsedCoreNum > branchAivNum) {
+            branchUsedCoreNum = branchAivNum;
+        }
+        if (branchBlockIdx >= branchUsedCoreNum) {
+            return;
+        }
+        int64_t branchRowOfTailBlock = curBs - (branchUsedCoreNum - 1) * branchRowOfFormerBlock;
+        bool isBranchTailBlock = (branchBlockIdx == branchUsedCoreNum - 1);
+        int64_t branchRowCount = isBranchTailBlock ? branchRowOfTailBlock : branchRowOfFormerBlock;
+        int64_t rowOuterLoop = (branchRowCount + curStage2RowFactor - 1) / curStage2RowFactor;
+        int64_t tailRowFactor = branchRowCount % curStage2RowFactor;
+        if (tailRowFactor == 0) {
+            tailRowFactor = curStage2RowFactor;
+        }
+        int64_t xGmBlockBaseOffsetPart2 =
+            branchBlockIdx * branchRowOfFormerBlock * tilingData->hcMult * tilingData->d;
+
+        if (branchIdx == 0) {
+            // ================= A 支（hin 支）=================
+            if (!fuseOn_) {
+                // fuse=on 时常量 CopyIn + MTE2_V 事件对已由 PrologueFuse 前置（逐笔同源）
+                CopyIn(hcBaseGm, hcBase0Local, 1, tilingData->hcMult);
+                CopyIn(hcScaleGm, hcScaleLocal, 1, 3);
+                event_t eventId = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
+                SetFlag<HardEvent::MTE2_V>(eventId);
+                WaitFlag<HardEvent::MTE2_V>(eventId);
+            }
+
+            // dLoop==1 时首块即尾块，取 tailDFactor
+            int64_t firstDFactor = (tilingData->dLoop == 1) ? tilingData->tailDFactor : tilingData->dFactor;
+            for (int64_t rowOuterIdx = 0; rowOuterIdx < rowOuterLoop; rowOuterIdx++) {
+                int64_t xGmBsBaseOffsetPart2 =
+                    rowOuterIdx * curStage2RowFactor * tilingData->hcMult * tilingData->d;
+                int64_t curRowFactor = (rowOuterIdx == rowOuterLoop - 1) ? tailRowFactor : curStage2RowFactor;
+                // 1) 按序挂三个搬运：squareSum(小) -> pre mix01(小) -> 首块 x(大)
+                squareSumOutLocal = squareSumQue.AllocTensor<float>();
+                CopyIn(workspaceGm[workspaceSize1 + workspaceSize2 +
+                        branchBlockIdx * branchRowOfFormerBlock * SQUARE_SUM_SIZE +
+                        rowOuterIdx * curStage2RowFactor * SQUARE_SUM_SIZE],
+                        squareSumOutLocal, stage1UsedCoreNum, curRowFactor * SQUARE_SUM_SIZE,
+                        CeilAlign(curBs, SQUARE_SUM_SIZE) * SQUARE_SUM_SIZE - curRowFactor * SQUARE_SUM_SIZE);
+                squareSumQue.EnQue(squareSumOutLocal);
+
+                mxies01Local = mixesQue01.AllocTensor<float>();
+                uint64_t mixBaseOffset = workspaceSize1 +
+                        branchBlockIdx * branchRowOfFormerBlock *
+                            CeilAlign(tilingData->hcMix, WORKSPACE_ALIGN_SIZE / sizeof(float)) +
+                        rowOuterIdx * curStage2RowFactor *
+                            CeilAlign(tilingData->hcMix, WORKSPACE_ALIGN_SIZE / sizeof(float));
+                // A 支只拉 pre 那 4 列（原第一次 CopyInWithOuterFor 的源/目的布局）
+                CopyInWithOuterFor(workspaceGm[mixBaseOffset], mxies01Local, stage1UsedCoreNum, curRowFactor,
+                        tilingData->hcMult, curBs,
+                        CeilAlign(tilingData->hcMix, WORKSPACE_ALIGN_SIZE / sizeof(float)));
+                mixesQue01.EnQue(mxies01Local);
+
+                if (xFirstBlockPrefetched_) {
+                    // fuse=on v2：rowOuterIdx=0 的首块 x 已由 PrologueFuse 在 barrier 前
+                    // 挂上（同一笔 AllocTensor+CopyIn+EnQue），跳过现场搬运，仅垫一次
+                    xFirstBlockPrefetched_ = false;
+                } else {
+                    xLocal = xQue.template AllocTensor<T>();
+                    CopyIn(xGm[xGmBlockBaseOffsetPart2 + xGmBsBaseOffsetPart2], xLocal,
+                            curRowFactor * tilingData->hcMult, firstDFactor, tilingData->d - firstDFactor);
+                    xQue.template EnQue(xLocal);
+                }
+
+                // 2) rsqrt 重算（不跨支共享）+ pre 归约/计算，垫在 x 搬运缝里
+                squareSumOutLocal = squareSumQue.DeQue<float>();
+                ReduceSumMidDimPerf(squareReduceLocal, squareSumOutLocal, treeReduceLocal, 1, stage1UsedCoreNum,
+                        curRowFactor * SQUARE_SUM_SIZE);
+                squareSumQue.FreeTensor(squareSumOutLocal);
+                int64_t curBsIdxForAll = branchBlockIdx * branchRowOfFormerBlock + rowOuterIdx * curStage2RowFactor;
+                GatherMaskByDiagonal(rsqrtLocal, squareReduceLocal,
+                        maskPatternLocal[(curBsIdxForAll % SQUARE_SUM_SIZE) * 8], curRowFactor);
+                float coeff = 1.0f / static_cast<float>(tilingData->k);
+                Muls(rsqrtLocal, rsqrtLocal, coeff, curRowFactor);
+                PipeBarrier<PIPE_V>();
+                Adds(rsqrtLocal, rsqrtLocal, tilingData->normEps, curRowFactor);
+                PipeBarrier<PIPE_V>();
+                Sqrt(rsqrtLocal, rsqrtLocal, curRowFactor);
+                Duplicate(rowBrcbLocal0, static_cast<float>(1.0f), curRowFactor);
+                PipeBarrier<PIPE_V>();
+                Div(rsqrtLocal, rowBrcbLocal0, rsqrtLocal, curRowFactor);
+
+                mxies01Local = mixesQue01.DeQue<float>();
+                ReduceSumMidDimPerf(mxies01ReduceLocal, mxies01Local, treeReduceLocal, 1, stage1UsedCoreNum,
+                        curRowFactor * tilingData->hcMultAlign);
+                mixesQue01.FreeTensor(mxies01Local);
+                ProcessPre(mxies01ReduceLocal, mxies01ReduceLocal, hcBase0Local, rsqrtLocal, rowBrcbLocal0,
+                        hcBrcbLocal1, hcScaleLocal.GetValue(0), tilingData->hcEps, curRowFactor,
+                        tilingData->hcMult);
+
+                // 3) 首块 ProcessY + hin 输出（x 搬运早已在途）
+                xLocal = xQue.template DeQue<T>();
+                yLocal = yQue.template AllocTensor<T>();
+                ProcessY(yLocal, xLocal, mxies01ReduceLocal, hcBrcbLocal1, xCastLocal, yCastLocal, curRowFactor,
+                        tilingData->hcMult, firstDFactor);
+                xQue.template FreeTensor(xLocal);
+                yQue.template EnQue(yLocal);
+                yLocal = yQue.template DeQue<T>();
+                CopyOut(yLocal, yGm[branchBlockIdx * branchRowOfFormerBlock * tilingData->d +
+                        rowOuterIdx * curStage2RowFactor * tilingData->d],
+                        curRowFactor, firstDFactor, tilingData->d - firstDFactor);
+                yQue.FreeTensor(yLocal);
+
+                // 4) 余下 d 块按“搬入-计算-输出”推进
+                for (int64_t dLoopIdx = 1; dLoopIdx < tilingData->dLoop; dLoopIdx++) {
+                    int64_t curDFactor =
+                        (dLoopIdx == tilingData->dLoop - 1) ? tilingData->tailDFactor : tilingData->dFactor;
+                    xLocal = xQue.template AllocTensor<T>();
+                    CopyIn(xGm[xGmBlockBaseOffsetPart2 + xGmBsBaseOffsetPart2 + dLoopIdx * tilingData->dFactor],
+                            xLocal, curRowFactor * tilingData->hcMult, curDFactor, tilingData->d - curDFactor);
+                    xQue.template EnQue(xLocal);
+                    xLocal = xQue.template DeQue<T>();
+                    yLocal = yQue.template AllocTensor<T>();
+                    ProcessY(yLocal, xLocal, mxies01ReduceLocal, hcBrcbLocal1, xCastLocal, yCastLocal, curRowFactor,
+                            tilingData->hcMult, curDFactor);
+                    xQue.template FreeTensor(xLocal);
+                    yQue.template EnQue(yLocal);
+                    yLocal = yQue.template DeQue<T>();
+                    CopyOut(yLocal, yGm[branchBlockIdx * branchRowOfFormerBlock * tilingData->d +
+                            rowOuterIdx * curStage2RowFactor * tilingData->d + dLoopIdx * tilingData->dFactor],
+                            curRowFactor, curDFactor, tilingData->d - curDFactor);
+                    yQue.FreeTensor(yLocal);
+                }
+            }
+            return;
+        }
+
+        // ================= B 支（res 支）=================
+        if (!fuseOn_) {
+            // fuse=on 时常量 CopyIn + MTE2_V 事件对已由 PrologueFuse 前置（逐笔同源）
+            CopyIn(hcBaseGm[tilingData->hcMult], hcBase1Local, 1, tilingData->hcMult);
+            CopyIn(hcBaseGm[tilingData->hcMult * NUM_TWO], hcBase2Local, tilingData->hcMult, tilingData->hcMult);
+            CopyIn(hcScaleGm, hcScaleLocal, 1, 3);
+            event_t eventIdB = static_cast<event_t>(GetTPipePtr()->FetchEventID(HardEvent::MTE2_V));
+            SetFlag<HardEvent::MTE2_V>(eventIdB);
+            WaitFlag<HardEvent::MTE2_V>(eventIdB);
+        }
+
+        for (int64_t rowOuterIdx = 0; rowOuterIdx < rowOuterLoop; rowOuterIdx++) {
+            int64_t curRowFactor = (rowOuterIdx == rowOuterLoop - 1) ? tailRowFactor : curStage2RowFactor;
+            // rsqrt 重算（B 支自算，不跨支共享）
+            squareSumOutLocal = squareSumQue.AllocTensor<float>();
+            CopyIn(workspaceGm[workspaceSize1 + workspaceSize2 +
+                    branchBlockIdx * branchRowOfFormerBlock * SQUARE_SUM_SIZE +
+                    rowOuterIdx * curStage2RowFactor * SQUARE_SUM_SIZE],
+                    squareSumOutLocal, stage1UsedCoreNum, curRowFactor * SQUARE_SUM_SIZE,
+                    CeilAlign(curBs, SQUARE_SUM_SIZE) * SQUARE_SUM_SIZE - curRowFactor * SQUARE_SUM_SIZE);
+            squareSumQue.EnQue(squareSumOutLocal);
+            squareSumOutLocal = squareSumQue.DeQue<float>();
+            ReduceSumMidDimPerf(squareReduceLocal, squareSumOutLocal, treeReduceLocal, 1, stage1UsedCoreNum,
+                    curRowFactor * SQUARE_SUM_SIZE);
+            squareSumQue.FreeTensor(squareSumOutLocal);
+            int64_t curBsIdxForAll = branchBlockIdx * branchRowOfFormerBlock + rowOuterIdx * curStage2RowFactor;
+            GatherMaskByDiagonal(rsqrtLocal, squareReduceLocal,
+                    maskPatternLocal[(curBsIdxForAll % SQUARE_SUM_SIZE) * 8], curRowFactor);
+            float coeff = 1.0f / static_cast<float>(tilingData->k);
+            Muls(rsqrtLocal, rsqrtLocal, coeff, curRowFactor);
+            PipeBarrier<PIPE_V>();
+            Adds(rsqrtLocal, rsqrtLocal, tilingData->normEps, curRowFactor);
+            PipeBarrier<PIPE_V>();
+            Sqrt(rsqrtLocal, rsqrtLocal, curRowFactor);
+            Duplicate(rowBrcbLocal0, static_cast<float>(1.0f), curRowFactor);
+            PipeBarrier<PIPE_V>();
+            Div(rsqrtLocal, rowBrcbLocal0, rsqrtLocal, curRowFactor);
+            // ProcessPost 与 combFrag 的 MulABLastDimBrcInline<false> 依赖 tmpBuffer0
+            // 已含 Brcb(rsqrt) 广播（off 串行链由 ProcessPre 的 MulABLastDimBrcInline<true>
+            // 顺带写入 rowBrcbLocal0；本支不跑 ProcessPre，显式补同一笔广播）
+            Brcb(rowBrcbLocal0, rsqrtLocal, CeilDiv(static_cast<int32_t>(curRowFactor), ONE_REPEAT_BLOCK_NUMS),
+                 {DEFAULT_BLOCK_STRIDE, DEFAULT_REPEAT_STRIDE});
+            PipeBarrier<PIPE_V>();
+
+            // post 4 列 gather：源用原第二次调用的偏移（+hcMult），落位 mxies01Local[0]，
+            // dim0=1 单支归约（不拉 pre 列）
+            mxies01Local = mixesQue01.AllocTensor<float>();
+            uint64_t mixBaseOffset = workspaceSize1 +
+                    branchBlockIdx * branchRowOfFormerBlock *
+                        CeilAlign(tilingData->hcMix, WORKSPACE_ALIGN_SIZE / sizeof(float)) +
+                    rowOuterIdx * curStage2RowFactor *
+                        CeilAlign(tilingData->hcMix, WORKSPACE_ALIGN_SIZE / sizeof(float)) +
+                    tilingData->hcMult;
+            CopyInWithOuterFor(workspaceGm[mixBaseOffset], mxies01Local, stage1UsedCoreNum, curRowFactor,
+                    tilingData->hcMult, curBs,
+                    CeilAlign(tilingData->hcMix, WORKSPACE_ALIGN_SIZE / sizeof(float)));
+            mixesQue01.EnQue(mxies01Local);
+            mxies01Local = mixesQue01.DeQue<float>();
+            ReduceSumMidDimPerf(mxies01ReduceLocal, mxies01Local, treeReduceLocal, 1, stage1UsedCoreNum,
+                    curRowFactor * tilingData->hcMultAlign);
+            mixesQue01.FreeTensor(mxies01Local);
+
+            // post 输出（mix 落位本支 mxies01ReduceLocal[0]，off 路径在 [rf*align] 处）
+            postLocal = postQue.AllocTensor<float>();
+            ProcessPost(postLocal, mxies01ReduceLocal, hcBase1Local, rsqrtLocal, rowBrcbLocal0, hcBrcbLocal1,
+                    hcScaleLocal.GetValue(1), curRowFactor, tilingData->hcMult);
+            postQue.EnQue(postLocal);
+            postLocal = postQue.DeQue<float>();
+            CopyOut(postLocal, postGm[branchBlockIdx * branchRowOfFormerBlock * tilingData->hcMult +
+                    rowOuterIdx * curStage2RowFactor * tilingData->hcMult],
+                    curRowFactor, tilingData->hcMult);
+            postQue.FreeTensor(postLocal);
+
+            // combFrag（res 16 列 gather + 缩放/bias + softmax + 20 轮 sinkhorn）
+            // 按 4x(4 元素) 子块搬运，dst 行距 8 的 row-padded 结构是下游读取契约
+            // （AddBAFirstDimBrcInline(hcBase2[4][8]) 等），不可折叠为 64B 大块
+            mixes2Local = mixesQue2.AllocTensor<float>();
+            for (int64_t i = 0; i < stage1UsedCoreNum; ++i) {
+                for (int64_t j = 0; j < curRowFactor; ++j) {
+                    CopyIn(workspaceGm[workspaceSize1 + i * curBs * mmLastAxisSize + j * mmLastAxisSize +
+                            branchBlockIdx * branchRowOfFormerBlock * mmLastAxisSize +
+                            rowOuterIdx * curStage2RowFactor * mmLastAxisSize + tilingData->hcMult * NUM_TWO],
+                            mixes2Local[(i * curRowFactor + j) * tilingData->hcMult * tilingData->hcMultAlign],
+                            tilingData->hcMult, tilingData->hcMult);
+                }
+            }
+            mixesQue2.EnQue(mixes2Local);
+            mixes2Local = mixesQue2.DeQue<float>();
+            ReduceSumMidDimPerf(mxies02ReduceLocal, mixes2Local, treeReduceLocal, 1, stage1UsedCoreNum,
+                    curRowFactor * tilingData->hcMult * tilingData->hcMultAlign);
+
+            combFragLocal = combFragQue.AllocTensor<float>();
+            MulABLastDimBrcInline<float, false>(mxies02ReduceLocal, mxies02ReduceLocal, rsqrtLocal, rowBrcbLocal0,
+                    curRowFactor, tilingData->hcMult * tilingData->hcMultAlign);
+            Muls(mxies02ReduceLocal, mxies02ReduceLocal, hcScaleLocal.GetValue(NUM_TWO),
+                    curRowFactor * tilingData->hcMult * tilingData->hcMultAlign);
+            PipeBarrier<PIPE_V>();
+            AddBAFirstDimBrcInline<float>(mxies02ReduceLocal, mxies02ReduceLocal, hcBase2Local, curRowFactor,
+                    tilingData->hcMult * tilingData->hcMultAlign);
+            SoftmaxFP32Perf(mxies02ReduceLocal, mxies02ReduceLocal, reduceLocal, hcBrcbLocal1,
+                    curRowFactor * tilingData->hcMult, tilingData->hcMult, tilingData->hcEps);
+
+            ReduceSumMidDimPerf(reduceLocal, mxies02ReduceLocal, treeReduceLocal, curRowFactor, tilingData->hcMult,
+                    tilingData->hcMult);
+            // reduceLocal 为 [curRowFactor][hcMultAlign] stride-8 布局, eps 须按行加
+            for (int64_t r = 0; r < curRowFactor; r++) {
+                Adds(reduceLocal[r * tilingData->hcMultAlign], reduceLocal[r * tilingData->hcMultAlign],
+                        tilingData->hcEps, tilingData->hcMult);
+            }
+            PipeBarrier<PIPE_V>();
+            DivABABrcInline(combFragLocal, mxies02ReduceLocal, reduceLocal, curRowFactor, tilingData->hcMult,
+                    tilingData->hcMult);
+
+            for (int64_t iter = 1; iter < tilingData->iterTimes; iter++) {
+                LastDimReduceSumPerf(reduceLocal, combFragLocal, curRowFactor * tilingData->hcMult, tilingData->hcMult);
+                Adds(reduceLocal, reduceLocal, tilingData->hcEps, curRowFactor * tilingData->hcMult);
+                PipeBarrier<PIPE_V>();
+                DivABLastDimBrcInline<float, true>(combFragLocal, combFragLocal, reduceLocal, hcBrcbLocal1,
+                        curRowFactor * tilingData->hcMult, tilingData->hcMult);
+                ReduceSumMidDimPerf(reduceLocal, combFragLocal, treeReduceLocal, curRowFactor, tilingData->hcMult,
+                        tilingData->hcMult);
+                for (int64_t r = 0; r < curRowFactor; r++) {
+                    Adds(reduceLocal[r * tilingData->hcMultAlign], reduceLocal[r * tilingData->hcMultAlign],
+                            tilingData->hcEps, tilingData->hcMult);
+                }
+                PipeBarrier<PIPE_V>();
+                DivABABrcInline(combFragLocal, combFragLocal, reduceLocal, curRowFactor, tilingData->hcMult,
+                        tilingData->hcMult);
+            }
+            mixesQue2.FreeTensor(mixes2Local);
+
+            combFragQue.EnQue(combFragLocal);
+            combFragLocal = combFragQue.DeQue<float>();
+            CopyOut(combFragLocal,
+                    combFragGm[branchBlockIdx * branchRowOfFormerBlock * tilingData->hcMult * tilingData->hcMult +
+                            rowOuterIdx * curStage2RowFactor * tilingData->hcMult * tilingData->hcMult],
+                    curRowFactor * tilingData->hcMult, tilingData->hcMult);
+            combFragQue.FreeTensor(combFragLocal);
+        }
+    }
+
 private:
     TPipe *pipe;
     const MhcPreClampSinkhornTilingData *tilingData;
@@ -844,6 +1303,15 @@ private:
     LocalTensor<float> yCastLocal;
     LocalTensor<float> squareSumOutLocal;
     LocalTensor<uint32_t> maskPatternLocal;
+
+    // fuse 旋钮（MHC_PRE_TINY_FUSE）kernel 侧状态：Init 时从 tiling 字段 tinyFuse 落位
+    bool fuseOn_ = false;
+    // v2 预取标记：PrologueFuse 已把 fork A 支 rowOuterIdx=0 的首 d 块 x EnQue，
+    // ProcessFork A 支首迭代据此跳过同一笔搬运（仅一次，用后即复位）
+    bool xFirstBlockPrefetched_ = false;
+    // v1 常量前置的 MTE2->V 事件 ID（PrologueFuse 只 Set 不 Wait，等待在
+    // WaitPrologueConsts 后置执行；仅 fuseOn_ 时有效）
+    event_t prologueConstEvt_ = static_cast<event_t>(0);
 };
 
 } // namespace MhcPreClampSinkhorn
