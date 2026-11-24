@@ -37,6 +37,12 @@
 #include "unpermute/moe_token_unpermute.h"
 
 
+// Temporary A2 cross-server diagnostics (disabled in the functional build).
+// #define DFFC_XS_STAGE1 1
+// #define DFFC_XS_STAGE2 1
+// #define DFFC_XS_STAGE3 1
+// #define DFFC_XS_STAGE0 1
+
 using namespace AscendC;
 
 namespace Catlass::Gemm::Kernel {
@@ -202,6 +208,12 @@ public:
     CATLASS_DEVICE
     void operator()<AscendC::AIC>(Params const &params)
     {
+#if defined(DFFC_XS_STAGE0) || defined(DFFC_XS_STAGE1) || defined(DFFC_XS_STAGE2) || defined(DFFC_XS_STAGE3)
+        // Diagnostics build: the AIV side returns early, so the cube side must
+        // not enter GMM1/GMM2 (it would wait on AIV flags that never come).
+        (void)params;
+        return;
+#endif
         GMM1(params);
 
         AscendC::CrossCoreWaitFlag<0x2>(SYNCFLAGV2C);
@@ -224,10 +236,32 @@ private:
         #else
             if (params.symmetricPtr != nullptr && params.kfcSegmentSize > 0) {
                 shmem.initKfc(params.symmetricPtr, static_cast<int32_t>(params.rankSize), params.kfcSegmentSize);
+                // A2 cross-server transport: parse kfcContextAddr -> HcclA2CombineOpParam
+                // -> aiRMAInfo so cross-server cells can be posted over AI-RDMA.
+                crossCtx_.Init(params.symmetricPtr, static_cast<int32_t>(params.rankSize));
             }
         #endif
+        // AI-RDMA doorbell scratch, kept 4KB below the top of UB.
+        ubRdmaLocal_ = resource.ubBuf.template GetBufferByByte<uint64_t>(ArchTag::UB_SIZE - 4096);
+        ubRdmaLocal_.SetSize(4);
+        ubRdmaHead_ = resource.ubBuf.template GetBufferByByte<uint32_t>(ArchTag::UB_SIZE - 4096 + UB_ALIGN);
+        ubRdmaHead_.SetSize(8);
+        shmem.setCrossServer(&crossCtx_, ubRdmaLocal_, ubRdmaHead_);
         workspaceInfo = WorkspaceInfo(params);
+        // Multi-flag KFC context: remote windows are mapped per direction and
+        // only cover winSize (the In window). Rebase the whole peermem layout
+        // to that window so TPE/flags/sync stay inside the mapped range.
         peermemInfo = PeermemInfo(params, shmem);
+        if (crossCtx_.ready && crossCtx_.winSize > 0 &&
+            static_cast<int64_t>(crossCtx_.winSize) < static_cast<int64_t>(shmem.SegmentSize())) {
+            shmem.setSegmentSize(static_cast<size_t>(crossCtx_.winSize));
+            peermemInfo = PeermemInfo(params, shmem);
+        }
+        // Reuse the (unused) workspace TPE slot for the cross-server D staging
+        // base; EP int32s only.
+        ptrStageBase_ = crossCtx_.ready
+                            ? reinterpret_cast<__gm__ int32_t *>(workspaceInfo.ptrTokenPerExpert)
+                            : nullptr;
 
         cumsumMM.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(workspaceInfo.ptrcumsumMM));
 
@@ -242,7 +276,8 @@ private:
 
         tokenPerExpert.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(shmem() + peermemInfo.offsetPeerTokenPerExpert));
 
-        tokenPerExpertLayout = Layout3D(AlignUp(params.EP * params.expertPerRank, ALIGN_128), params.expertPerRank);
+        paddedExpertNumAligned = AlignUp(params.EP * params.expertPerRank, ALIGN_128);
+        tokenPerExpertLayout = Layout3D(paddedExpertNumAligned, params.expertPerRank);
         preSumBeforeRank.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(workspaceInfo.ptrSumBeforeRank));
     }
 
@@ -330,6 +365,60 @@ private:
             tmpBuffer1,
             {U16(EP), U16((expertPerRank) * sizeof(int32_t)), 0, 0}
         );
+    }
+
+    // Cross-node dispatch push: receiver-side row offsets for a destination.
+    // Fills dstCum[i * alignedEpr + j] = sum_{i' <= i} T[i'][dstRank][j], the
+    // TPE column owned by dstRank cumsum'd along the source dimension — the
+    // same quantity dstRank computes as its own cumsumMM, so a sender can
+    // place its rows exactly where the destination's conversion loop reads
+    // them. UB must stay valid across the whole push loop: place it outside
+    // the [0,32KB) and [96KB,128KB) regions CopyGMToGM uses as ping-pong.
+    CATLASS_DEVICE
+    void GetColumnCumsumForDst(Params const &params, AscendC::LocalTensor<int32_t> &dstCum, int32_t dstRank)
+    {
+        const int32_t alignedEpr = (params.expertPerRank + 7) / 8 * 8;
+        AscendC::DataCopyPad(
+            dstCum, tokenPerExpert[dstRank * params.expertPerRank],
+            {static_cast<uint16_t>(params.EP), static_cast<uint16_t>(params.expertPerRank * sizeof(int32_t)),
+             static_cast<uint16_t>((paddedExpertNumAligned - params.expertPerRank) * sizeof(int32_t)),
+             static_cast<uint16_t>((alignedEpr - params.expertPerRank) * sizeof(int32_t))},
+            {});
+        AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
+        for (int32_t i = 1; i < params.EP; ++i) {
+            AscendC::Add(dstCum[i * alignedEpr], dstCum[i * alignedEpr], dstCum[(i - 1) * alignedEpr],
+                         params.expertPerRank);
+            AscendC::PipeBarrier<PIPE_V>();
+        }
+        // The push loop reads these values with scalar GetValue.
+        AscendC::SetFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+        AscendC::WaitFlag<AscendC::HardEvent::V_S>(EVENT_ID0);
+    }
+
+    // Bounded MTE2 wait for a cross-server dispatch flag. Returns the last
+    // value read (0 on timeout). 1 = data, 2 = sender skipped this cell.
+    CATLASS_DEVICE
+    int32_t WaitFlagValue(GM_ADDR flagAddr, AscendC::LocalTensor<int32_t> &ub, uint64_t timeoutCycles)
+    {
+        AscendC::GlobalTensor<int32_t> flagGm;
+        flagGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(flagAddr));
+        constexpr uint32_t kCheckMask = 1023U;
+        const int64_t waitStart = AscendC::GetSystemCycle();
+        uint32_t poll = 0;
+        while (true) {
+            AscendC::DataCopy(ub, flagGm, 8);
+            AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+            AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(EVENT_ID0);
+            const int32_t v = ub.GetValue(0);
+            if (v != 0) {
+                return v;
+            }
+            if ((++poll & kCheckMask) == 0U &&
+                static_cast<uint64_t>(AscendC::GetSystemCycle() - waitStart) >= timeoutCycles) {
+                return 0;
+            }
+        }
     }
 
     CATLASS_DEVICE
@@ -611,9 +700,6 @@ private:
             }
             AscendC::GlobalTensor<int32_t> srcAddress;
             srcAddress.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(shmem() + localTokenPerExpertOffset));
-            AscendC::GlobalTensor<int32_t> dstAddress;
-            __gm__ void* dstPeermemPtr = shmem(localTokenPerExpertOffset, coreIdx);
-            dstAddress.SetGlobalBuffer((__gm__ int32_t * )dstPeermemPtr);
 
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
             using TType = Gemm::GemmType<int32_t, layout::RowMajor>;
@@ -623,9 +709,9 @@ private:
             CopyUbToGm copyUbToGm;
             
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
-            
-            copyGmToUb(tmpBuffer, srcAddress[0], 
-                layout::RowMajor{ 1, numPerCore}, 
+
+            copyGmToUb(tmpBuffer, srcAddress[0],
+                layout::RowMajor{ 1, numPerCore},
                 layout::RowMajor{1, numPerCore});
 
             AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
@@ -633,9 +719,38 @@ private:
             AscendC::Adds(tmpBuffer, tmpBuffer, 0x800000, numPerCore);
             AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
-            copyUbToGm(dstAddress[0], tmpBuffer, 
-                layout::RowMajor{ 1, numPerCore}, 
-                layout::RowMajor{1, numPerCore});
+            // Same server: IPC direct write; cross server: A2 direct peer
+            // writes do not land, so stage the row in the local Out window and
+            // post it with AI-RDMA (source LOCAL_OUTPUT -> peer REMOTE_INPUT).
+            if (!(crossCtx_.ready && crossCtx_.CrossServer(dstEpIdx))) {
+                AscendC::GlobalTensor<int32_t> dstAddress;
+                __gm__ void* dstPeermemPtr = shmem(localTokenPerExpertOffset, coreIdx);
+                dstAddress.SetGlobalBuffer((__gm__ int32_t * )dstPeermemPtr);
+                copyUbToGm(dstAddress[0], tmpBuffer,
+                    layout::RowMajor{ 1, numPerCore},
+                    layout::RowMajor{1, numPerCore});
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+            } else {
+                AscendC::GlobalTensor<int32_t> outTpe;
+                outTpe.SetGlobalBuffer(
+                    reinterpret_cast<__gm__ int32_t *>(crossCtx_.LocalOut() + localTokenPerExpertOffset));
+                copyUbToGm(outTpe[0], tmpBuffer,
+                    layout::RowMajor{ 1, numPerCore},
+                    layout::RowMajor{1, numPerCore});
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                AscendC::PipeBarrier<PIPE_ALL>();
+                if (!DffcA2::AivRdmaPostSendTry(
+                        reinterpret_cast<GM_ADDR>(crossCtx_.LocalOut() + localTokenPerExpertOffset),
+                        reinterpret_cast<GM_ADDR>(crossCtx_.In(dstEpIdx) + localTokenPerExpertOffset),
+                        static_cast<uint64_t>(dstEpIdx),
+                        static_cast<uint64_t>(numPerCore) * sizeof(int32_t), crossCtx_.qp, ubRdmaLocal_,
+                        ubRdmaHead_)) {
+                    ++xsTpeFails_;
+                }
+                AscendC::PipeBarrier<PIPE_ALL>();
+            }
             AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
             AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
         }
@@ -644,7 +759,9 @@ private:
                 int32_t intPer512 = CACHE_LINE / sizeof(int);
                 for(int32_t checkIdx = 0; checkIdx < AlignUp(params.EP * params.expertPerRank, 128); checkIdx += intPer512) {
                     __gm__ int32_t* sync_check = reinterpret_cast<__gm__ int32_t*>(shmem() + peermemInfo.offsetPeerTokenPerExpert) + tokenPerExpertLayout(dstEpIdx, 0, checkIdx);
-                    gm_signal_wait_until_ne(sync_check, 0);
+                    if (!gm_signal_wait_until_ne_try(sync_check, 0, 3ULL * 1000ULL * 1000ULL * 50ULL)) {
+                        ++xsTpePollFails_;
+                    }
                 }
                 AscendC::DataCopy(tmpBuffer, tokenPerExpert[tokenPerExpertLayout(dstEpIdx, 0, 0)], numPerCore);
                 AscendC::SetFlag<AscendC::HardEvent::MTE2_V>(EVENT_ID0);
@@ -751,18 +868,104 @@ private:
         GM_ADDR localTokenPerExpert = shmem() + localTokenPerExpertOffset;
         uint32_t expandedRowIdxOffset = AlignUp(params.problemShape.m(), 256) * params.topK * sizeof(int32_t);
 
-        moe_init_routing_v2<ElementA>(reinterpret_cast<GM_ADDR> (params.ptrA), params.expertIdx, shmem() + peermemInfo.offsetA,
+        const bool crossNode = crossCtx_.ready && params.EP > 8;
+        // Cross-node: outbound tokens are staged in the local Out window so
+        // they can be pushed with AI-RDMA (source must be LOCAL_OUTPUT).
+        GM_ADDR expandedXBase = crossNode ? (crossCtx_.LocalOut() + peermemInfo.offsetA)
+                                          : (shmem() + peermemInfo.offsetA);
+        moe_init_routing_v2<ElementA>(reinterpret_cast<GM_ADDR> (params.ptrA), params.expertIdx, expandedXBase,
         workspaceInfo.expandedRowIdx, localTokenPerExpert, params.expertTokensBeforeCapacity,
         params.ptrWorkspace + expandedRowIdxOffset,
         &params.moeInitRoutingQuantV2TilingData, params.initRoutingQuantTilingKey);
 
         AscendC::SyncAll<true>();
+#ifdef DFFC_XS_STAGE0
+        {
+            __gm__ int32_t *p0 = reinterpret_cast<__gm__ int32_t *>(params.ptrOutput);
+            p0[0] = params.rank;
+            p0[1] = 10;
+            AscendC::GlobalTensor<int32_t> p0Gm;
+            p0Gm.SetGlobalBuffer(p0);
+            AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                              AscendC::DcciDst::CACHELINE_OUT>(p0Gm);
+        }
+        AscendC::SyncAll<true>();
+        return;
+#endif
+
+        if (crossNode) {
+            // Clear the per-cell dispatch flags in this rank's In window before
+            // anything can write them this call. The flags live in persistent
+            // window memory and the receive side polls for "non-zero", so a
+            // leftover 1/2 from a previous call could make a later call skip a
+            // cell that actually carries data. The sweep must happen before
+            // this rank's TPE row is sent: every sender's push pass waits for
+            // that row, so no flag write can race the sweep.
+            if (coreIdx == 0) {
+                const int64_t sweepOff = static_cast<int64_t>(shmem.SegmentSize()) - 3 * MB_SIZE;
+                const int32_t sweepInts = static_cast<int32_t>(params.EP) * params.expertPerRank * 16;
+                AscendC::LocalTensor<int32_t> zUb = resource.ubBuf.template GetBufferByByte<int32_t>(64 * 1024);
+                zUb.SetSize(static_cast<uint32_t>(sweepInts));
+                AscendC::Duplicate(zUb, 0, sweepInts);
+                AscendC::SetFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::V_MTE3>(EVENT_ID0);
+                AscendC::GlobalTensor<int32_t> zGm;
+                zGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(crossCtx_.LocalIn() + sweepOff));
+                AscendC::DataCopy(zGm, zUb, static_cast<uint16_t>(sweepInts));
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+            }
+            AscendC::SyncAll<true>();
+        }
+
         CrossRankSyncAndlocalTokenPerExpertAllGatherAndGetSumPreRankV2(params, localTokenPerExpertOffset);
+#ifdef DFFC_XS_STAGE1
+        {
+            __gm__ int32_t *p1 = reinterpret_cast<__gm__ int32_t *>(params.ptrOutput);
+            p1[0] = params.rank;
+            p1[1] = 11;
+            AscendC::GlobalTensor<int32_t> p1Gm;
+            p1Gm.SetGlobalBuffer(p1);
+            AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                              AscendC::DcciDst::CACHELINE_OUT>(p1Gm);
+        }
+        AscendC::SyncAll<true>();
+        return;
+#endif
 
         if (coreIdx == 0) {
             GetCumsumForMMAIV(tokenPerExpert, cumsumMM, params.expertPerRank, params.rank, params.EP);
+            if (crossNode) {
+                // Per-destination staging base for the cross-server combine D
+                // mirror. Destination d owns L_d = sum_g TPE(d, me, g) rows and
+                // the mirrors are packed back to back, because the rows of the
+                // destinations' own D regions all start at offset 0.
+                AscendC::LocalTensor<int32_t> baseUb = resource.ubBuf.template GetBufferByByte<int32_t>(
+                    (params.EP * params.expertPerRank + 2048) * static_cast<int32_t>(sizeof(int32_t)));
+                baseUb.SetSize(static_cast<uint32_t>(params.EP));
+                int32_t acc = 0;
+                for (int32_t d = 0; d < static_cast<int32_t>(params.EP); ++d) {
+                    baseUb.SetValue(d, acc);
+                    for (int32_t g = 0; g < static_cast<int32_t>(params.expertPerRank); ++g) {
+                        acc += tokenPerExpert(tokenPerExpertLayout(d, params.rank, g));
+                    }
+                }
+                AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+                AscendC::GlobalTensor<int32_t> baseGm;
+                baseGm.SetGlobalBuffer(ptrStageBase_);
+                AscendC::DataCopyPad(
+                    baseGm, baseUb,
+                    AscendC::DataCopyParams{1, static_cast<uint16_t>(params.EP * sizeof(int32_t)), 0, 0});
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                for (int32_t off = 0; off < static_cast<int32_t>(params.EP); off += 16) {
+                    AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                                      AscendC::DcciDst::CACHELINE_OUT>(baseGm[off]);
+                }
+            }
         }
-        
+
         uint32_t curGroupOffset = 0;
         int32_t prevSumBeforeRank = 0;
         int32_t prevSum = 0;
@@ -770,7 +973,7 @@ private:
             prevSum = preSumBeforeRank(coreIdx * params.expertPerRank);
         }
         AscendC::SyncAll<true>();
-        
+
         AscendC::GlobalTensor<int32_t> ExpertTokenNums;
         ExpertTokenNums.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.ptrExpertTokenNums));
         if(coreIdx == 0)
@@ -780,6 +983,168 @@ private:
         uint16_t syncgmm1Idx = 0;
         AscendC::CrossCoreSetFlag<0x2, PIPE_MTE3>(syncgmm1Idx / CROSS_CORE_FLAG_MAX_SET_COUNT);
         syncgmm1Idx++;
+
+        // ---- Dispatch push (cross-server group only) ----
+        // Each core owns one destination rank. For every expert group it pushes
+        // this rank's rows into that destination's In window at the
+        // destination-side rowStart (derived from the all-gathered TPE column)
+        // and then posts a 32B flag on the same QP. Self cells are copied
+        // locally. Rows are BF16 with no per-token scale tail.
+        int64_t dispatchFlagOff = 0;
+        int64_t dispatchStageOff = 0;
+        if (crossNode) {
+            const int64_t rowElems = static_cast<int64_t>(params.problemShape.k());
+            dispatchFlagOff = static_cast<int64_t>(shmem.SegmentSize()) - 3 * MB_SIZE;
+            dispatchStageOff = dispatchFlagOff +
+                               static_cast<int64_t>(params.EP) * params.expertPerRank * 64;
+            // Cross-server V2 status slots (+64 state==1, +96 state==0).
+            shmem.setV2Stage(crossCtx_.LocalOut() + dispatchStageOff + 64);
+            if (coreIdx == 0) {
+                // Stage with an MTE3 DMA, not scalar stores: the AI-RDMA engine
+                // reads this region from HBM, and a scalar store only becomes
+                // visible after a cache flush whose granularity is one 64B line.
+                AscendC::LocalTensor<int32_t> stgUb = resource.ubBuf.template GetBufferByByte<int32_t>(
+                    (params.EP * params.expertPerRank + 2048) * static_cast<int32_t>(sizeof(int32_t)));
+                stgUb.SetSize(32);
+                for (int32_t i = 0; i < 8; ++i) {
+                    stgUb.SetValue(i, (i == 0) ? 1 : 0);              // data marker
+                    stgUb.SetValue(8 + i, (i == 0) ? 2 : 0);          // skip marker
+                    stgUb.SetValue(16 + i, (i == 0) ? 0x3F800000 : 0);// V2 state 1
+                    stgUb.SetValue(24 + i, 0);                        // V2 state 0
+                }
+                AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(EVENT_ID0);
+                AscendC::GlobalTensor<int32_t> stgGm;
+                stgGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t *>(crossCtx_.LocalOut() + dispatchStageOff));
+                AscendC::DataCopyPad(stgGm, stgUb, AscendC::DataCopyParams{1, 128, 0, 0});
+                AscendC::SetFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+                AscendC::WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);
+            }
+            AscendC::SyncAll<true>();
+            // Offset of this rank's first cell for dst==coreIdx inside its own
+            // outbound buffer: prefix over (dst' < dst, all groups) in row "me".
+            uint32_t srcRow = 0;
+            // Receiver-side offsets for the destination this core owns. The
+            // destination's conversion loop places source-s rows at
+            //   sum_{g'<g} sum_i T[i][dst][g']  +  sum_{s'<s} T[s'][dst][g]
+            // (its own group bases and source prefixes). The sender must use
+            // the SAME layout, derived from the all-gathered TPE column of dst.
+            const int32_t xsAlignedEpr = (params.expertPerRank + 7) / 8 * 8;
+            int64_t dstBase = 0;   // sum_{g'<g} sum_i T[i][dst][g']
+            AscendC::LocalTensor<int32_t> dstCumUb =
+                resource.ubBuf.template GetBufferByByte<int32_t>(64 * 1024);
+            dstCumUb.SetSize(static_cast<uint32_t>(params.EP * xsAlignedEpr));
+            if (coreIdx < params.EP) {
+                for (int32_t d = 0; d < static_cast<int32_t>(coreIdx); ++d) {
+                    for (int32_t gg = 0; gg < params.expertPerRank; ++gg) {
+                        srcRow += static_cast<uint32_t>(
+                            tokenPerExpert(tokenPerExpertLayout(params.rank, d, gg)));
+                    }
+                }
+                GetColumnCumsumForDst(params, dstCumUb, static_cast<int32_t>(coreIdx));
+            }
+            for (int32_t g = 0; g < params.expertPerRank; ++g) {
+                if (coreIdx < params.EP) {
+                    const int32_t dst = coreIdx;
+                    // Rows this rank sends to dst's group g: T[me][dst][g].
+                    const uint32_t rowsAll =
+                        static_cast<uint32_t>(tokenPerExpert(tokenPerExpertLayout(params.rank, dst, g)));
+                    const int32_t srcPre = (params.rank == 0)
+                                               ? 0
+                                               : dstCumUb.GetValue((params.rank - 1) * xsAlignedEpr + g);
+                    const uint32_t dstRowStart = static_cast<uint32_t>(dstBase + static_cast<int64_t>(srcPre));
+                    uint32_t rows = rowsAll;
+                    bool postData = false;
+                    if (rows > 0 && dstRowStart < params.maxOutputSize) {
+                        if (dstRowStart + rows > params.maxOutputSize) {
+                            rows = params.maxOutputSize - dstRowStart;
+                        }
+                        postData = (rows > 0);
+                    }
+                    if (postData) {
+                        GM_ADDR srcPtr = crossCtx_.LocalOut() + peermemInfo.offsetA +
+                                         static_cast<int64_t>(srcRow) * rowElems * sizeof(ElementA);
+                        GM_ADDR dstPtr = crossCtx_.In(dst) + peermemInfo.offsetA +
+                                         static_cast<int64_t>(dstRowStart) * rowElems * sizeof(ElementA);
+                        const uint64_t bytes = static_cast<uint64_t>(rows) * static_cast<uint64_t>(rowElems) *
+                                               sizeof(ElementA);
+                        if (dst == params.rank || !crossCtx_.CrossServer(dst)) {
+                            // Self or same-server peer: IPC direct copy.
+                            AscendC::GlobalTensor<ElementA> dG;
+                            AscendC::GlobalTensor<ElementA> sG;
+                            GM_ADDR peerDst = (dst == params.rank)
+                                                  ? dstPtr
+                                                  : (shmem(peermemInfo.offsetA +
+                                                               static_cast<int64_t>(dstRowStart) * rowElems *
+                                                                   sizeof(ElementA), dst));
+                            dG.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(peerDst));
+                            sG.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(srcPtr));
+                            CopyGMToGM(dG, sG, static_cast<int32_t>(rows * rowElems), params.ubMoveNum);
+                        } else {
+                            if (!DffcA2::AivRdmaPostSendTry(srcPtr, dstPtr,
+                                                            static_cast<uint64_t>(dst), bytes,
+                                                            crossCtx_.qp, ubRdmaLocal_, ubRdmaHead_)) {
+                                ++xsTpeFails_;
+                            }
+                        }
+                    }
+                    // Every cell posts a flag: 1 = data pushed, 2 = skipped.
+                    if (dst != params.rank) {
+                        const int64_t markerOff = dispatchStageOff + (postData ? 0 : 32);
+                        const int64_t slotOff = dispatchFlagOff +
+                            static_cast<int64_t>(params.rank * params.expertPerRank + g) * 64;
+                        if (crossCtx_.CrossServer(dst)) {
+                            if (!DffcA2::AivRdmaPostSendTry(
+                                    crossCtx_.LocalOut() + markerOff,
+                                    crossCtx_.In(dst) + slotOff,
+                                    static_cast<uint64_t>(dst), 32, crossCtx_.qp, ubRdmaLocal_,
+                                    ubRdmaHead_)) {
+                                ++xsTpePollFails_;
+                            }
+                        } else {
+                            __gm__ int32_t *pf2 = reinterpret_cast<__gm__ int32_t *>(
+                                shmem(slotOff, dst));
+                            gm_dcci(reinterpret_cast<__gm__ uint8_t *>(pf2));
+                            *pf2 = postData ? 1 : 2;
+                            gm_dcci(reinterpret_cast<__gm__ uint8_t *>(pf2));
+                        }
+                    }
+                    // Advance along dst's group bases (its own totals) and this
+                    // rank's sorted outbound layout.
+                    dstBase += static_cast<int64_t>(dstCumUb.GetValue(
+                        (params.EP - 1) * xsAlignedEpr + g));
+                    srcRow += rowsAll;
+                }
+            }
+            AscendC::SyncAll<true>();
+            // Diagnostic (temporary): push/TPE health per core.
+            if (coreIdx < 64) {
+                __gm__ int32_t *dbg = reinterpret_cast<__gm__ int32_t *>(params.ptrOutput);
+                dbg[128 + coreIdx * 4 + 0] = static_cast<int32_t>(coreIdx);
+                dbg[128 + coreIdx * 4 + 1] = static_cast<int32_t>(
+                    dispatchFlagOff);   // absolute flag area offset (sanity)
+                dbg[128 + coreIdx * 4 + 2] = xsTpeFails_ * 1000 + xsTpePollFails_;
+                dbg[128 + coreIdx * 4 + 3] = static_cast<int32_t>(shmem.SegmentSize()) / (1024 * 1024);
+                AscendC::GlobalTensor<int32_t> dg;
+                dg.SetGlobalBuffer(dbg + 128 + coreIdx * 4);
+                AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                                  AscendC::DcciDst::CACHELINE_OUT>(dg);
+            }
+            AscendC::SyncAll<true>();
+        }
+#ifdef DFFC_XS_STAGE3
+        {
+            __gm__ int32_t *p3 = reinterpret_cast<__gm__ int32_t *>(params.ptrOutput);
+            p3[0] = params.rank;
+            p3[1] = 13;
+            AscendC::GlobalTensor<int32_t> p3Gm;
+            p3Gm.SetGlobalBuffer(p3);
+            AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                              AscendC::DcciDst::CACHELINE_OUT>(p3Gm);
+        }
+        AscendC::SyncAll<true>();
+        return;
+#endif
 
         uint32_t prevGroupSum1 = 0, dequantSum1 = 0, dequantSum2 = 0;
         uint32_t dequantSum = 0;
@@ -795,17 +1160,67 @@ private:
                     if (rowStart + rows > params.maxOutputSize) {
                         rows = params.maxOutputSize - rowStart;
                     }
-                    uint32_t rowSrc = prevSum;
-                    prevSum += rows;
-                    GM_ADDR otherRankPtr = shmem(0, dstEpIdx);
-                    AscendC::GlobalTensor<ElementA> gmRemoteA;
-                    gmRemoteA.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA*>(otherRankPtr + peermemInfo.offsetA));
+                    if (crossNode) {
+                        if (rows == 0 && dstEpIdx == params.rank) {
+                            continue;
+                        }
+                        // Cross-node: the push pass landed every source's rows
+                        // in this rank's own In window at rowStart (receiver-
+                        // side layout). Self cells were copied Out -> In.
+                        AscendC::LocalTensor<int32_t> flagUb =
+                            resource.ubBuf.template GetBufferByByte<int32_t>(ArchTag::UB_SIZE - 4096 + 64);
+                        flagUb.SetSize(8);
+                        if (dstEpIdx != params.rank) {
+                            const int64_t slot =
+                                static_cast<int64_t>(dstEpIdx * params.expertPerRank + groupIdx) * 64;
+                            GM_ADDR flagAddr = crossCtx_.LocalIn() + dispatchFlagOff + slot;
+                            const int32_t fv = WaitFlagValue(flagAddr, flagUb, 1ULL * 1000ULL * 1000ULL * 50ULL);
+                            // Reset before acting, including the skip path: the
+                            // flag lives in persistent window memory and the
+                            // next call polls for "non-zero".
+                            {
+                                __gm__ int32_t *fp = reinterpret_cast<__gm__ int32_t *>(flagAddr);
+                                gm_dcci(reinterpret_cast<__gm__ uint8_t *>(fp));
+                                *fp = 0;
+                                gm_dcci(reinterpret_cast<__gm__ uint8_t *>(fp));
+                            }
+                            if (fv == 2) {
+                                continue; // sender skipped this cell
+                            }
+                            if (fv != 1) {
+                                // Diagnostic (temporary): record and continue
+                                // instead of trapping, so the run completes and
+                                // the test can dump the observation.
+                                __gm__ int32_t *dbg = reinterpret_cast<__gm__ int32_t *>(params.ptrOutput);
+                                dbg[64 + params.rank] = fv;
+                                dbg[80 + params.rank] = dstEpIdx * 16 + groupIdx;
+                                AscendC::GlobalTensor<int32_t> dg;
+                                dg.SetGlobalBuffer(dbg + 64);
+                                AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                                                  AscendC::DcciDst::CACHELINE_OUT>(dg);
+                            }
+                        }
+                        AscendC::GlobalTensor<ElementA> gmSrcA;
+                        gmSrcA.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA *>(
+                            crossCtx_.LocalIn() + peermemInfo.offsetA));
+                        MatrixCoord offsetA{rowStart, 0};
+                        MatrixCoord offsetPeer{rowStart, 0};
+                        int64_t gmOffsetA = params.layoutA.GetOffset(offsetA);
+                        int64_t gmOffsetPeer = params.layoutA.GetOffset(offsetPeer);
+                        CopyGMToGM(gmA[gmOffsetA], gmSrcA[gmOffsetPeer], rows * params.problemShape.k(), params.ubMoveNum);
+                    } else {
+                        uint32_t rowSrc = prevSum;
+                        prevSum += rows;
+                        GM_ADDR otherRankPtr = shmem(0, dstEpIdx);
+                        AscendC::GlobalTensor<ElementA> gmRemoteA;
+                        gmRemoteA.SetGlobalBuffer(reinterpret_cast<__gm__ ElementA*>(otherRankPtr + peermemInfo.offsetA));
 
-                    MatrixCoord offsetA{rowStart, 0};
-                    MatrixCoord offsetPeer{rowSrc, 0};
-                    int64_t gmOffsetA = params.layoutA.GetOffset(offsetA);
-                    int64_t gmOffsetPeer = params.layoutA.GetOffset(offsetPeer);
-                    CopyGMToGM(gmA[gmOffsetA], gmRemoteA[gmOffsetPeer], rows * params.problemShape.k(), params.ubMoveNum);
+                        MatrixCoord offsetA{rowStart, 0};
+                        MatrixCoord offsetPeer{rowSrc, 0};
+                        int64_t gmOffsetA = params.layoutA.GetOffset(offsetA);
+                        int64_t gmOffsetPeer = params.layoutA.GetOffset(offsetPeer);
+                        CopyGMToGM(gmA[gmOffsetA], gmRemoteA[gmOffsetPeer], rows * params.problemShape.k(), params.ubMoveNum);
+                    }
                 }
             }
             AscendC::SyncAll<true>();
@@ -833,6 +1248,19 @@ private:
             }
         }
 
+#ifdef DFFC_XS_STAGE2
+        {
+            __gm__ int32_t *p2 = reinterpret_cast<__gm__ int32_t *>(params.ptrOutput);
+            p2[0] = params.rank;
+            p2[1] = 12;
+            AscendC::GlobalTensor<int32_t> p2Gm;
+            p2Gm.SetGlobalBuffer(p2);
+            AscendC::DataCacheCleanAndInvalid<int32_t, AscendC::CacheLine::SINGLE_CACHE_LINE,
+                                              AscendC::DcciDst::CACHELINE_OUT>(p2Gm);
+        }
+        AscendC::SyncAll<true>();
+        return;
+#endif
         uint32_t n2 = params.problemShape.k();
 
         typename BlockEpilogue2::Params epilogueParams{
@@ -844,7 +1272,8 @@ private:
             static_cast<int32_t>(n2),
             static_cast<int32_t>(L1TileShape::N),
             shmem,
-            static_cast<int32_t>(peermemInfo.offsetD)
+            static_cast<int32_t>(peermemInfo.offsetD),
+            crossNode ? ptrStageBase_ : nullptr
         };
 
         BlockEpilogue2 blockEpilogue2(resource, epilogueParams);
@@ -896,6 +1325,8 @@ private:
         CombineV2(params, blockEpilogue2);
 
         AscendC::SyncAll<true>();
+        PushDCrossServer(params);
+        AscendC::SyncAll<true>();
         #ifndef __CROSSRANKSYNCANDALLGATHERV1__
         ResetTokenPerExpert(params.EP * AlignUp(params.EP * params.expertPerRank, 128));
         #endif
@@ -928,6 +1359,59 @@ private:
             kernelMoeTokenUnpermuteOp.Process();
         }
 
+    }
+
+    // ---- Combine D push (cross-server only) ----
+    // The combine epilogue staged the rows of every cross-server destination in
+    // this rank's Out window at exactly the row offsets that destination reads
+    // them from in its own In window. Each core owns one destination rank and
+    // posts one AI-RDMA WRITE per (dst, group) cell (source LOCAL_OUTPUT ->
+    // peer REMOTE_INPUT). Self / same-server rows were written in place by the
+    // epilogue (outAt), and the V2 status posted later rides the same QP, so a
+    // destination may read its D region right after CrossRankSyncV2Wait.
+    CATLASS_DEVICE
+    void PushDCrossServer(Params const &params)
+    {
+        if (!(crossCtx_.ready && params.EP > 8) || coreIdx >= params.EP) {
+            return;
+        }
+        const int32_t dst = static_cast<int32_t>(coreIdx);
+        if (!crossCtx_.CrossServer(dst)) {
+            return;
+        }
+        const int64_t rowBytes = static_cast<int64_t>(params.problemShape.k()) *
+                                 static_cast<int64_t>(sizeof(ElementD2));
+        GM_ADDR srcBase = crossCtx_.LocalOut() + peermemInfo.offsetD;
+        GM_ADDR dstBase = crossCtx_.In(dst) + peermemInfo.offsetD;
+        // Source row walks the packed staging mirror; the destination row is
+        // the same one the epilogue computed for dst's own D region.
+        int64_t stageRow = static_cast<int64_t>(ptrStageBase_[dst]);
+        for (int32_t g = 0; g < params.expertPerRank; ++g) {
+            const int32_t rows = static_cast<int32_t>(
+                tokenPerExpert(tokenPerExpertLayout(dst, params.rank, g)));
+            if (rows <= 0) {
+                continue;
+            }
+            const int64_t dstRowStart = static_cast<int64_t>(
+                preSumBeforeRank(dst * params.expertPerRank + g));
+            int64_t pushRows = static_cast<int64_t>(rows);
+            if (dstRowStart >= static_cast<int64_t>(params.maxOutputSize)) {
+                stageRow += rows;
+                continue;
+            }
+            if (dstRowStart + pushRows > static_cast<int64_t>(params.maxOutputSize)) {
+                pushRows = static_cast<int64_t>(params.maxOutputSize) - dstRowStart;
+            }
+            if (pushRows > 0) {
+                DffcA2::AivRdmaPostSend(srcBase + stageRow * rowBytes,
+                                        dstBase + dstRowStart * rowBytes,
+                                        static_cast<uint64_t>(dst),
+                                        static_cast<uint64_t>(pushRows) * static_cast<uint64_t>(rowBytes),
+                                        crossCtx_.qp, ubRdmaLocal_, ubRdmaHead_);
+                ++xsDPushCnt_;
+            }
+            stageRow += rows;
+        }
     }
 
     CATLASS_DEVICE
@@ -1096,6 +1580,18 @@ private:
 
     Layout3D tokenPerExpertLayout;
     HcclShmem shmem;
+    int32_t paddedExpertNumAligned{0};
+
+    // A2 cross-server (KFC + AI-RDMA) transport.
+    DffcA2::CrossServerCtx crossCtx_;
+    // Cross-node D staging base per destination (workspace, EP int32s).
+    __gm__ int32_t *ptrStageBase_{nullptr};
+    // Diagnostic counters (cross-server bring-up).
+    int32_t xsTpeFails_{0};
+    int32_t xsTpePollFails_{0};
+    int32_t xsDPushCnt_{0};
+    AscendC::LocalTensor<uint64_t> ubRdmaLocal_;
+    AscendC::LocalTensor<uint32_t> ubRdmaHead_;
 };
 
 } // namespace Catlass::Gemm::Kernel

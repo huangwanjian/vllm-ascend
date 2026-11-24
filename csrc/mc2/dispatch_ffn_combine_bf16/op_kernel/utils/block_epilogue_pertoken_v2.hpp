@@ -56,15 +56,20 @@ public:
         int32_t rank;
         HcclShmem shmem;
         int32_t offsetD;
+        // Cross-server D staging: stageBase[d] is the first Out-window row
+        // reserved for destination d. Destinations are packed back-to-back
+        // because their own D-region row offsets start at 0 and would overlap.
+        __gm__ int32_t *ptrStageBase{nullptr};
 
         CATLASS_DEVICE
         Params() {};
         CATLASS_DEVICE
         Params(int32_t EP_, int32_t expertPerRank_, int32_t rank_, __gm__ int32_t *ptrTokenPerExpert_,
-        LayoutC layoutC_, int32_t n2_, int32_t n0_, HcclShmem& shmem_, int32_t offsetD_) :
+        LayoutC layoutC_, int32_t n2_, int32_t n0_, HcclShmem& shmem_, int32_t offsetD_,
+        __gm__ int32_t *ptrStageBase_) :
         ptrTokenPerExpert(ptrTokenPerExpert_), EP(EP_),
         expertPerRank(expertPerRank_),rank(rank_), layoutC(layoutC_), n2(n2_), n0(n0_),
-        shmem(shmem_), offsetD(offsetD_)
+        shmem(shmem_), offsetD(offsetD_), ptrStageBase(ptrStageBase_)
          {}
     };
 
@@ -158,7 +163,19 @@ public:
                 dstOffsetInExpert = stTile - stRankInExpert;
             }
             AscendC::GlobalTensor<ElementD> gmRemotePeer;
-            __gm__ void* dstPeermemPtr = params.shmem(params.offsetD, dstEpIdx);
+            // Cross-server destinations are staged in the local Out window;
+            // shift their rows by (stageBase[d] - sectionStart[d]) so that the
+            // per-destination mirrors, whose own row offsets all start at 0,
+            // stay disjoint. The D push pass undoes the shift on the wire.
+            int64_t stageShiftBytes = 0;
+            if (params.ptrStageBase != nullptr && params.shmem.IsCrossServer(dstEpIdx)) {
+                const int64_t stageBase = static_cast<int64_t>(params.ptrStageBase[dstEpIdx]);
+                const int64_t dstSectionStart =
+                    static_cast<int64_t>(preSumBeforeRank(dstEpIdx * params.expertPerRank));
+                stageShiftBytes = (stageBase - dstSectionStart) * static_cast<int64_t>(params.n2) *
+                                  static_cast<int64_t>(sizeof(ElementD));
+            }
+            __gm__ void* dstPeermemPtr = params.shmem.outAt(params.offsetD + stageShiftBytes, dstEpIdx);
             gmRemotePeer.SetGlobalBuffer(reinterpret_cast<__gm__ ElementD*>(dstPeermemPtr));
             MatrixCoord dstOffset{dstOffsetInExpert + dstExpertOffset, blockCoord.n()};
             int64_t gmDstOffset = params.layoutC.GetOffset(dstOffset);
